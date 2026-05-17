@@ -169,6 +169,8 @@ mysql:     127.0.0.1:3307
 redis:     127.0.0.1:6379
 ```
 
+Docker 版本还包含一个 Python `ai-service`，Worker 会通过 gRPC 调用它进行标签分析。该服务只在 Docker 内部暴露 `9000`，并通过只读共享 volume 读取 `/app/storage/original/...` 图片路径。
+
 注意：Docker 内部服务仍通过 `mysql:3306` 通信；为了避免和本机 MySQL 冲突，默认把容器 MySQL 映射到宿主机 `3307`。
 
 ## 1. 初始化 MySQL
@@ -384,6 +386,64 @@ GET /api/devices
 ```http
 GET /api/tasks/status
 ```
+
+## gRPC AI 服务
+
+Worker 已经把标签生成重构为可选 gRPC 调用：
+
+```text
+worker -> ai-service:9000 -> /vision.v1.VisionAnalysisService/AnalyzeImage
+```
+
+第一版 `ai-service` 是 Python 服务，暂不接真实模型，只复刻原有规则标签逻辑。gRPC 请求只传图片 URI，不传图片 bytes：
+
+```text
+image_uri=/app/storage/original/img_xxx.jpg
+```
+
+相关配置：
+
+```text
+AI_RPC_ENABLED=true
+AI_RPC_ADDR=ai-service:9000
+AI_RPC_TIMEOUT_SECONDS=5
+```
+
+如果 `ai-service` 不可用、超时或无法读取图片，Worker 会自动降级为 Go 本地规则标签，图片任务仍会完成。
+
+协议文件：
+
+```text
+proto/vision/v1/vision.proto
+```
+
+重新生成 Go/Python Protobuf 代码：
+
+```powershell
+.\generate-proto.cmd
+```
+
+默认使用：
+
+```text
+D:\tools\protoc-35.0-rc-2-win64\bin\protoc.exe
+```
+
+如果 protoc 在其他路径，可先设置：
+
+```powershell
+$env:PROTOC_PATH="D:\tools\protoc-35.0-rc-2-win64\bin\protoc.exe"
+.\generate-proto.cmd
+```
+
+Worker 和 AI 服务均支持横向扩展：
+
+```powershell
+docker compose up -d --scale worker=3 worker
+docker compose up -d --scale ai-service=3 ai-service
+```
+
+`worker` 与 `ai-service` 都没有固定 `container_name`，多个实例不会发生容器命名冲突。
 
 ## Storage 抽象层
 

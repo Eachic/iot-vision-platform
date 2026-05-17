@@ -85,6 +85,9 @@ services:
       REDIS_PASSWORD: ""
       STORAGE_ROOT: /app/storage
       DEVICE_TOKEN: course-demo-token
+      AI_RPC_ENABLED: "true"
+      AI_RPC_ADDR: ai-service:9000
+      AI_RPC_TIMEOUT_SECONDS: "5"
       TZ: Asia/Shanghai
     volumes:
       - app-storage:/app/storage
@@ -93,6 +96,24 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      ai-service:
+        condition: service_started
+
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+      args:
+        IMAGE_REGISTRY: docker.m.daocloud.io/library
+    restart: unless-stopped
+    environment:
+      AI_SERVICE_PORT: "9000"
+      AI_SERVICE_WORKERS: "8"
+      TZ: Asia/Shanghai
+    expose:
+      - "9000"
+    volumes:
+      - app-storage:/app/storage:ro
 
   edge-node:
     build:

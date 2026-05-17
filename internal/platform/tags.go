@@ -7,8 +7,8 @@ import (
 )
 
 type GeneratedTag struct {
-	Tag        string
-	Confidence float64
+	Tag        string  `json:"tag"`
+	Confidence float64 `json:"confidence"`
 }
 
 func GenerateTags(img image.Image, originalName string) []GeneratedTag {

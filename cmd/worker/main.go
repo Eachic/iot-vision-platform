@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"image"
 	"log"
 	"path/filepath"
 	"time"
@@ -14,10 +15,11 @@ import (
 )
 
 type worker struct {
-	db    *gorm.DB
-	redis *redis.Client
-	cfg   platform.Config
-	name  string
+	db       *gorm.DB
+	redis    *redis.Client
+	cfg      platform.Config
+	name     string
+	analyzer platform.VisionAnalyzer
 }
 
 func main() {
@@ -38,6 +40,16 @@ func main() {
 	}
 
 	w := &worker{db: db, redis: rdb, cfg: cfg, name: "worker-" + platform.NewID("node")}
+	if cfg.AIRPCEnabled {
+		analyzer, err := platform.NewGRPCVisionAnalyzer(cfg.AIRPCAddr)
+		if err != nil {
+			log.Printf("ai rpc unavailable, worker will use local tag fallback: %v", err)
+		} else {
+			w.analyzer = analyzer
+			defer analyzer.Close()
+			log.Printf("ai rpc enabled: %s", cfg.AIRPCAddr)
+		}
+	}
 	if useRedis {
 		if err := rdb.XGroupCreateMkStream(ctx, "image_uploaded_stream", "image_workers", "0").Err(); err != nil {
 			if !isBusyGroup(err) {
@@ -118,7 +130,7 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 		w.markFailed(imageID, err)
 		return err
 	}
-	tags := platform.GenerateTags(img, originalName)
+	tags := w.analyzeTags(ctx, imageID, originalPath, originalName, img)
 	err = w.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("image_id = ?", imageID).Delete(&platform.ImageTag{}).Error; err != nil {
 			return err
@@ -143,6 +155,27 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 		}).Error
 	})
 	return err
+}
+
+func (w *worker) analyzeTags(ctx context.Context, imageID string, originalPath string, originalName string, img image.Image) []platform.GeneratedTag {
+	if w.analyzer == nil {
+		return platform.GenerateTags(img, originalName)
+	}
+	aiCtx, cancel := context.WithTimeout(ctx, w.cfg.AIRPCTimeout)
+	defer cancel()
+	tags, err := w.analyzer.Analyze(aiCtx, platform.AnalyzeImageRequest{
+		RequestID:   platform.NewID("ai_req"),
+		ImageID:     imageID,
+		ImageURI:    filepath.ToSlash(originalPath),
+		Filename:    originalName,
+		ContentType: "image/" + platform.DetectFormatFromName(originalName),
+		Tasks:       []platform.AnalysisTask{{Type: "classification"}},
+	})
+	if err != nil {
+		log.Printf("ai analyze failed image=%s err=%v; fallback to local tags", imageID, err)
+		return platform.GenerateTags(img, originalName)
+	}
+	return tags
 }
 
 func (w *worker) pollDatabase() error {
@@ -183,5 +216,3 @@ func value(msg redis.XMessage, key string) string {
 func isBusyGroup(err error) bool {
 	return err != nil && (err.Error() == "BUSYGROUP Consumer Group name already exists" || len(err.Error()) >= 9 && err.Error()[:9] == "BUSYGROUP")
 }
-
-

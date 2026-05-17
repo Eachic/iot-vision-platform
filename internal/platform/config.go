@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -14,6 +16,9 @@ type Config struct {
 	StorageRoot    string
 	DeviceToken    string
 	EdgeDedup      bool
+	AIRPCEnabled   bool
+	AIRPCAddr      string
+	AIRPCTimeout   time.Duration
 	CloudAPIAddr   string
 	EdgeNodeAddr   string
 	CloudUploadURL string
@@ -28,6 +33,9 @@ func LoadConfig() Config {
 		StorageRoot:    cleanPath(env("STORAGE_ROOT", "./storage")),
 		DeviceToken:    env("DEVICE_TOKEN", "course-demo-token"),
 		EdgeDedup:      envBool("EDGE_DEDUP_ENABLED", true),
+		AIRPCEnabled:   envBool("AI_RPC_ENABLED", true),
+		AIRPCAddr:      env("AI_RPC_ADDR", "127.0.0.1:9000"),
+		AIRPCTimeout:   time.Duration(envInt("AI_RPC_TIMEOUT_SECONDS", 5)) * time.Second,
 		CloudAPIAddr:   env("CLOUD_API_ADDR", ":8080"),
 		EdgeNodeAddr:   env("EDGE_NODE_ADDR", ":8081"),
 		CloudUploadURL: env("CLOUD_UPLOAD_URL", "http://127.0.0.1:8080/api/images/upload"),
@@ -51,6 +59,18 @@ func envBool(key string, fallback bool) bool {
 	default:
 		return fallback
 	}
+}
+
+func envInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }
 
 func loadDotEnv(path string) {

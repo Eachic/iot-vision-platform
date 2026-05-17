@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package vision.v1;
+
+// Go package is documented for future protoc generation. The current MVP uses
+// gRPC with a JSON codec to avoid requiring protoc on developer machines.
+option go_package = "iot-vision-platform/internal/visionpb;visionpb";
+
+service VisionAnalysisService {
+  rpc AnalyzeImage(AnalyzeImageRequest) returns (AnalyzeImageResponse);
+}
+
+message AnalyzeImageRequest {
+  string request_id = 1;
+  string image_id = 2;
+  string image_uri = 3;
+  string filename = 4;
+  string content_type = 5;
+  repeated AnalysisTask tasks = 6;
+  map<string, string> params = 7;
+}
+
+message AnalysisTask {
+  string type = 1;
+  map<string, string> params = 2;
+}
+
+message AnalyzeImageResponse {
+  string request_id = 1;
+  string image_id = 2;
+  string model = 3;
+  int64 latency_ms = 4;
+  repeated AnalysisOutput outputs = 5;
+}
+
+message AnalysisOutput {
+  string type = 1;
+  ClassificationResult classification = 2;
+  DetectionResult detection = 3;
+  ProcessedImageResult processed_image = 4;
+  TextResult text = 5;
+  map<string, string> custom = 100;
+}
+
+message ClassificationResult {
+  repeated Label labels = 1;
+}
+
+message Label {
+  string tag = 1;
+  double confidence = 2;
+}
+
+message DetectionResult {
+  repeated Detection detections = 1;
+}
+
+message Detection {
+  string label = 1;
+  double confidence = 2;
+  BoundingBox box = 3;
+}
+
+message BoundingBox {
+  double x = 1;
+  double y = 2;
+  double width = 3;
+  double height = 4;
+  string coordinate_type = 5;
+}
+
+message ProcessedImageResult {
+  string uri = 1;
+  string content_type = 2;
+  string storage_key = 3;
+}
+
+message TextResult {
+  string text = 1;
+}

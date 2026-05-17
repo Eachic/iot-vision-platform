@@ -1,5 +1,6 @@
 .git
 .gocache
+.tools
 bin
 logs
 storage
