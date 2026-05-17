@@ -14,3 +14,5 @@ pressure-test/generated-test-images/
 ai-service/__pycache__/
 *.pyc
 *.log
+
+tools/
