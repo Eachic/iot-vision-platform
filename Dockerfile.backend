@@ -1,0 +1,25 @@
+ARG IMAGE_REGISTRY=docker.m.daocloud.io/library
+
+FROM ${IMAGE_REGISTRY}/golang:1.26-alpine AS builder
+
+ARG SERVICE=cloud-api
+ARG GOPROXY=https://goproxy.cn,direct
+
+ENV GOPROXY=${GOPROXY}
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/app ./cmd/${SERVICE}
+
+FROM ${IMAGE_REGISTRY}/alpine:3.20
+
+WORKDIR /app
+RUN mkdir -p /app/storage/original /app/storage/thumbnail /app/storage/edge-cache
+
+COPY --from=builder /out/app /app/app
+
+EXPOSE 8080 8081
+CMD ["/app/app"]

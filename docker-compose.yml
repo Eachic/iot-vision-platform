@@ -1,0 +1,154 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: iot-vision-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: iot_vision
+      MYSQL_USER: iot_user
+      MYSQL_PASSWORD: iot_password
+      TZ: Asia/Shanghai
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./deploy/mysql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot_password"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    container_name: iot-vision-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  cloud-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        SERVICE: cloud-api
+        GOPROXY: https://goproxy.cn,direct
+        IMAGE_REGISTRY: docker.m.daocloud.io/library
+    container_name: iot-vision-cloud-api
+    restart: unless-stopped
+    environment:
+      MYSQL_DSN: iot_user:iot_password@tcp(mysql:3306)/iot_vision?charset=utf8mb4&parseTime=True&loc=Local
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      STORAGE_ROOT: /app/storage
+      DEVICE_TOKEN: course-demo-token
+      CLOUD_API_ADDR: :8080
+      EDGE_NODE_ADDR: :8081
+      CLOUD_UPLOAD_URL: http://cloud-api:8080/api/images/upload
+      TZ: Asia/Shanghai
+    ports:
+      - "8080:8080"
+    volumes:
+      - app-storage:/app/storage
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
+      interval: 8s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        SERVICE: worker
+        GOPROXY: https://goproxy.cn,direct
+        IMAGE_REGISTRY: docker.m.daocloud.io/library
+    restart: unless-stopped
+    environment:
+      MYSQL_DSN: iot_user:iot_password@tcp(mysql:3306)/iot_vision?charset=utf8mb4&parseTime=True&loc=Local
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      STORAGE_ROOT: /app/storage
+      DEVICE_TOKEN: course-demo-token
+      TZ: Asia/Shanghai
+    volumes:
+      - app-storage:/app/storage
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  edge-node:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+      args:
+        SERVICE: edge-node
+        GOPROXY: https://goproxy.cn,direct
+        IMAGE_REGISTRY: docker.m.daocloud.io/library
+    container_name: iot-vision-edge-node
+    restart: unless-stopped
+    environment:
+      STORAGE_ROOT: /app/storage
+      DEVICE_TOKEN: course-demo-token
+      EDGE_DEDUP_ENABLED: "false"
+      EDGE_NODE_ADDR: :8081
+      CLOUD_UPLOAD_URL: http://cloud-api:8080/api/images/upload
+      TZ: Asia/Shanghai
+    ports:
+      - "8081:8081"
+    volumes:
+      - app-storage:/app/storage
+    depends_on:
+      cloud-api:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        IMAGE_REGISTRY: docker.m.daocloud.io/library
+    container_name: iot-vision-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      cloud-api:
+        condition: service_healthy
+
+  simulator:
+    build:
+      context: ./device-simulator
+      dockerfile: Dockerfile
+      args:
+        IMAGE_REGISTRY: docker.m.daocloud.io/library
+    container_name: iot-vision-simulator
+    profiles:
+      - simulator
+    environment:
+      TZ: Asia/Shanghai
+    depends_on:
+      edge-node:
+        condition: service_started
+
+volumes:
+  mysql-data:
+  redis-data:
+  app-storage:

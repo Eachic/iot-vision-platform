@@ -1,0 +1,14 @@
+.env
+storage/
+bin/
+.gocache/
+.cache/
+frontend/node_modules/
+frontend/dist/
+device-simulator/sample-images/
+pressure-test/generated-images/
+pressure-test/generated-images-*/
+pressure-test/generated-test-images/
+**/__pycache__/
+*.pyc
+*.log

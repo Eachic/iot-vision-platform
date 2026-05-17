@@ -1,0 +1,11 @@
+.git
+.gocache
+bin
+logs
+storage
+frontend/node_modules
+frontend/dist
+device-simulator/sample-images
+**/__pycache__
+*.pyc
+.env
