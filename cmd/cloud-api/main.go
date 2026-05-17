@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -19,6 +22,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-redis/redis/v8"
+	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
 
@@ -34,6 +38,24 @@ type imageResponse struct {
 	platform.ImageRecord
 	OriginalURL  string `json:"original_url"`
 	ThumbnailURL string `json:"thumbnail_url"`
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type userResponse struct {
+	ID       uint64 `json:"id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+}
+
+type tokenClaims struct {
+	UserID   uint64 `json:"user_id"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
+	Exp      int64  `json:"exp"`
 }
 
 func main() {
@@ -52,6 +74,9 @@ func main() {
 	}
 
 	a := &app{cfg: cfg, db: db, redis: rdb}
+	if err := a.ensureDefaultAdmin(); err != nil {
+		panic(err)
+	}
 	router := gin.Default()
 	router.Use(corsMiddleware())
 	router.MaxMultipartMemory = maxUploadSize
@@ -60,12 +85,16 @@ func main() {
 
 	api := router.Group("/api")
 	api.GET("/health", a.health)
+	api.POST("/auth/login", a.login)
 	api.POST("/images/upload", a.uploadImage)
-	api.GET("/images", a.listImages)
-	api.GET("/images/:image_id", a.getImage)
-	api.GET("/devices", a.listDevices)
-	api.GET("/tasks/status", a.taskStatus)
-	api.GET("/stats", a.stats)
+	protected := api.Group("")
+	protected.Use(a.authMiddleware())
+	protected.GET("/auth/me", a.me)
+	protected.GET("/images", a.listImages)
+	protected.GET("/images/:image_id", a.getImage)
+	protected.GET("/devices", a.listDevices)
+	protected.GET("/tasks/status", a.taskStatus)
+	protected.GET("/stats", a.stats)
 
 	if err := router.Run(cfg.CloudAPIAddr); err != nil {
 		panic(err)
@@ -85,10 +114,153 @@ func (a *app) health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
+func (a *app) ensureDefaultAdmin() error {
+	username := strings.TrimSpace(a.cfg.DefaultAdmin)
+	password := strings.TrimSpace(a.cfg.DefaultPass)
+	if username == "" || password == "" {
+		return nil
+	}
+	var count int64
+	if err := a.db.Model(&platform.User{}).Where("username = ?", username).Count(&count).Error; err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	return a.db.Create(&platform.User{
+		Username:     username,
+		PasswordHash: string(hash),
+		Role:         "admin",
+	}).Error
+}
+
+func (a *app) login(c *gin.Context) {
+	var req loginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid login request"})
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	password := strings.TrimSpace(req.Password)
+	if username == "" || password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "username and password are required"})
+		return
+	}
+	var user platform.User
+	if err := a.db.Where("username = ?", username).First(&user).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid username or password"})
+		return
+	}
+	token, err := a.signToken(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"token": token, "user": mapUser(user)})
+}
+
+func (a *app) me(c *gin.Context) {
+	user, ok := currentUser(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"user": mapUser(user)})
+}
+
+func (a *app) authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := strings.TrimSpace(c.GetHeader("Authorization"))
+		if !strings.HasPrefix(header, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing bearer token"})
+			return
+		}
+		claims, err := a.verifyToken(strings.TrimSpace(strings.TrimPrefix(header, "Bearer ")))
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+			return
+		}
+		var user platform.User
+		if err := a.db.Where("id = ? AND username = ?", claims.UserID, claims.Username).First(&user).Error; err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid user"})
+			return
+		}
+		c.Set("current_user", user)
+		c.Next()
+	}
+}
+
+func (a *app) signToken(user platform.User) (string, error) {
+	expiresAt := time.Now().Add(time.Duration(max(1, a.cfg.JWTExpireHours)) * time.Hour).Unix()
+	claims := tokenClaims{UserID: user.ID, Username: user.Username, Role: user.Role, Exp: expiresAt}
+	header := map[string]string{"alg": "HS256", "typ": "JWT"}
+	headerRaw, err := json.Marshal(header)
+	if err != nil {
+		return "", err
+	}
+	claimsRaw, err := json.Marshal(claims)
+	if err != nil {
+		return "", err
+	}
+	unsigned := base64.RawURLEncoding.EncodeToString(headerRaw) + "." + base64.RawURLEncoding.EncodeToString(claimsRaw)
+	return unsigned + "." + a.tokenSignature(unsigned), nil
+}
+
+func (a *app) verifyToken(token string) (tokenClaims, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return tokenClaims{}, errors.New("invalid token format")
+	}
+	unsigned := parts[0] + "." + parts[1]
+	expected := a.tokenSignature(unsigned)
+	if !hmac.Equal([]byte(expected), []byte(parts[2])) {
+		return tokenClaims{}, errors.New("invalid token signature")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return tokenClaims{}, err
+	}
+	var claims tokenClaims
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return tokenClaims{}, err
+	}
+	if claims.Exp <= time.Now().Unix() {
+		return tokenClaims{}, errors.New("token expired")
+	}
+	return claims, nil
+}
+
+func (a *app) tokenSignature(unsigned string) string {
+	mac := hmac.New(sha256.New, []byte(a.cfg.JWTSecret))
+	_, _ = mac.Write([]byte(unsigned))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func currentUser(c *gin.Context) (platform.User, bool) {
+	raw, ok := c.Get("current_user")
+	if !ok {
+		return platform.User{}, false
+	}
+	user, ok := raw.(platform.User)
+	return user, ok
+}
+
+func mapUser(user platform.User) userResponse {
+	return userResponse{ID: user.ID, Username: user.Username, Role: user.Role}
+}
+
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, X-Device-Token")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, X-Device-Token, Authorization")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)

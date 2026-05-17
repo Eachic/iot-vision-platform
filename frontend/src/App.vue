@@ -7,6 +7,8 @@ const api = axios.create({
   timeout: 8000
 })
 
+const AUTH_TOKEN_KEY = 'iot_vision_token'
+
 const STATUS_LABELS = {
   queued: '排队中',
   processing: '处理中',
@@ -16,9 +18,15 @@ const STATUS_LABELS = {
 
 const activeView = ref('overview')
 const loading = ref(false)
+const authLoading = ref(false)
+const bootstrapping = ref(true)
 const apiError = ref('')
+const authError = ref('')
 const lastUpdated = ref('')
 const preview = ref(null)
+const authToken = ref(localStorage.getItem(AUTH_TOKEN_KEY) || '')
+const currentUser = ref(null)
+const loginForm = ref({ username: 'admin', password: 'admin123456' })
 const images = ref([])
 const devices = ref([])
 const taskStatus = ref({ counts: {}, recent: [] })
@@ -39,6 +47,26 @@ const pageTitle = computed(() => {
   const item = navItems.find(nav => nav.id === activeView.value)
   return item ? item.label : '总览'
 })
+
+const isAuthenticated = computed(() => Boolean(authToken.value && currentUser.value))
+
+api.interceptors.request.use(config => {
+  if (authToken.value) {
+    config.headers = config.headers || {}
+    config.headers.Authorization = `Bearer ${authToken.value}`
+  }
+  return config
+})
+
+api.interceptors.response.use(
+  response => response,
+  error => {
+    if (error && error.response && error.response.status === 401) {
+      clearAuth()
+    }
+    return Promise.reject(error)
+  }
+)
 
 const availableTags = computed(() => {
   const set = new Set()
@@ -73,6 +101,7 @@ const completedRatio = computed(() => {
 })
 
 async function refresh() {
+  if (!isAuthenticated.value) return
   loading.value = true
   try {
     const params = {}
@@ -107,6 +136,67 @@ async function refresh() {
   } finally {
     loading.value = false
   }
+}
+
+async function login() {
+  authLoading.value = true
+  authError.value = ''
+  try {
+    const res = await api.post('/auth/login', {
+      username: loginForm.value.username,
+      password: loginForm.value.password
+    })
+    authToken.value = res.data.token || ''
+    currentUser.value = res.data.user || null
+    if (!authToken.value || !currentUser.value) {
+      throw new Error('登录响应缺少 token')
+    }
+    localStorage.setItem(AUTH_TOKEN_KEY, authToken.value)
+    await refresh()
+  } catch (error) {
+    clearAuth()
+    authError.value = error && error.response && error.response.data && error.response.data.error
+      ? error.response.data.error
+      : '登录失败，请检查账号密码'
+  } finally {
+    authLoading.value = false
+  }
+}
+
+async function loadCurrentUser() {
+  if (!authToken.value) {
+    bootstrapping.value = false
+    return
+  }
+  try {
+    const res = await api.get('/auth/me')
+    currentUser.value = res.data.user || null
+    if (currentUser.value) {
+      await refresh()
+    } else {
+      clearAuth()
+    }
+  } catch (error) {
+    clearAuth()
+  } finally {
+    bootstrapping.value = false
+  }
+}
+
+function logout() {
+  clearAuth()
+  apiError.value = ''
+  authError.value = ''
+  images.value = []
+  devices.value = []
+  taskStatus.value = { counts: {}, recent: [] }
+  stats.value = { images: 0, devices: 0, today: 0, tags: [] }
+}
+
+function clearAuth() {
+  authToken.value = ''
+  currentUser.value = null
+  localStorage.removeItem(AUTH_TOKEN_KEY)
 }
 
 function resetFilters() {
@@ -155,7 +245,7 @@ function fileSize(size) {
 }
 
 onMounted(() => {
-  refresh()
+  loadCurrentUser()
   refreshTimer = window.setInterval(refresh, 5000)
 })
 
@@ -165,7 +255,41 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app-shell">
+  <div v-if="bootstrapping" class="auth-shell">
+    <section class="auth-card">
+      <div class="brand-logo">IoT</div>
+      <h1>视觉数据平台</h1>
+      <p>正在验证登录状态...</p>
+    </section>
+  </div>
+
+  <div v-else-if="!isAuthenticated" class="auth-shell">
+    <section class="auth-card login-card">
+      <div class="brand-logo">IoT</div>
+      <div>
+        <p class="eyebrow">IoT Vision Data Platform</p>
+        <h1>登录视觉数据平台</h1>
+        <p>使用管理员账号进入图库、设备、任务和统计控制台。</p>
+      </div>
+      <form class="login-form" @submit.prevent="login">
+        <label>
+          <span>账号</span>
+          <input v-model.trim="loginForm.username" autocomplete="username" placeholder="admin">
+        </label>
+        <label>
+          <span>密码</span>
+          <input v-model="loginForm.password" autocomplete="current-password" placeholder="admin123456" type="password">
+        </label>
+        <button class="primary-btn" :disabled="authLoading" type="submit">
+          {{ authLoading ? '登录中...' : '登录' }}
+        </button>
+      </form>
+      <div v-if="authError" class="notice auth-notice">{{ authError }}</div>
+      <small>默认账号：admin / admin123456</small>
+    </section>
+  </div>
+
+  <div v-else class="app-shell">
     <aside class="app-sidebar">
       <div class="brand-block">
         <div class="brand-logo">IoT</div>
@@ -207,10 +331,12 @@ onBeforeUnmount(() => {
           <p>设备模拟采集、边缘去重缓存、云端入库、异步缩略图与智能标签生成。</p>
         </div>
         <div class="hero-actions">
+          <span class="refresh-time">{{ currentUser.username }} · {{ currentUser.role }}</span>
           <span class="refresh-time">最近刷新 {{ lastUpdated || '-' }}</span>
           <button class="primary-btn" :disabled="loading" @click="refresh">
             {{ loading ? '刷新中...' : '刷新数据' }}
           </button>
+          <button class="ghost-btn" @click="logout">退出登录</button>
         </div>
       </header>
 

@@ -127,6 +127,13 @@ python pressure-test/pressure_upload.py --low --target http://127.0.0.1:8080/api
 http://127.0.0.1:5173
 ```
 
+默认登录账号：
+
+```text
+username: admin
+password: admin123456
+```
+
 查看服务状态：
 
 ```powershell
@@ -173,6 +180,25 @@ Docker 版本还包含一个 Python `ai-service`，Worker 会通过 gRPC 调用�
 
 注意：Docker 内部服务仍通过 `mysql:3306` 通信；为了避免和本机 MySQL 冲突，默认把容器 MySQL 映射到宿主机 `3307`。
 
+### 登录认证
+
+平台管理端使用 JWT 登录认证。cloud-api 首次启动时会自动检查并创建默认管理员账号，账号密码可通过环境变量修改：
+
+```text
+JWT_SECRET=course-demo-jwt-secret
+JWT_EXPIRE_HOURS=24
+DEFAULT_ADMIN_USERNAME=admin
+DEFAULT_ADMIN_PASSWORD=admin123456
+```
+
+前端登录成功后会把 token 保存到浏览器 `localStorage`，后续请求自动携带：
+
+```http
+Authorization: Bearer <token>
+```
+
+设备上传不使用浏览器 JWT，仍然走独立的 `X-Device-Token`，方便说明“端侧设备认证”和“管理后台用户认证”是两条不同链路。
+
 ## 1. 初始化 MySQL
 
 由于本机 `mysql` 命令可能不在 PATH，推荐用 MySQL Workbench、DataGrip、Navicat 或 MySQL Installer 提供的命令行工具执行：
@@ -209,6 +235,10 @@ EDGE_DEDUP_ENABLED=true
 CLOUD_API_ADDR=:8080
 EDGE_NODE_ADDR=:8081
 CLOUD_UPLOAD_URL=http://127.0.0.1:8080/api/images/upload
+JWT_SECRET=course-demo-jwt-secret
+JWT_EXPIRE_HOURS=24
+DEFAULT_ADMIN_USERNAME=admin
+DEFAULT_ADMIN_PASSWORD=admin123456
 ```
 
 ## 3. 启动 Redis
@@ -349,6 +379,42 @@ http://127.0.0.1:5173
 
 ## API 摘要
 
+### 用户登录
+
+```http
+POST /api/auth/login
+Content-Type: application/json
+```
+
+请求：
+
+```json
+{
+  "username": "admin",
+  "password": "admin123456"
+}
+```
+
+返回：
+
+```json
+{
+  "token": "...",
+  "user": {
+    "id": 1,
+    "username": "admin",
+    "role": "admin"
+  }
+}
+```
+
+### 当前用户
+
+```http
+GET /api/auth/me
+Authorization: Bearer <token>
+```
+
 ### 上传图片
 
 ```http
@@ -370,6 +436,7 @@ captured_at
 
 ```http
 GET /api/images?device_id=device_001&status=completed&tag=wide-view&page=1&page_size=60&sort_by=created_at&sort_order=desc
+Authorization: Bearer <token>
 ```
 
 支持参数：`device_id`、`tag`、`status`、`start_time`、`end_time`、`page`、`page_size`、`sort_by`、`sort_order`。
@@ -379,12 +446,42 @@ GET /api/images?device_id=device_001&status=completed&tag=wide-view&page=1&page_
 
 ```http
 GET /api/devices
+Authorization: Bearer <token>
 ```
 
 ### 查询任务状态
 
 ```http
 GET /api/tasks/status
+Authorization: Bearer <token>
+```
+
+### 查询统计
+
+```http
+GET /api/stats
+Authorization: Bearer <token>
+```
+
+公开接口：
+
+```text
+GET  /api/health
+POST /api/auth/login
+POST /api/images/upload
+GET  /files/original/...
+GET  /files/thumbnail/...
+```
+
+需要 JWT 的接口：
+
+```text
+GET /api/auth/me
+GET /api/images
+GET /api/images/:image_id
+GET /api/devices
+GET /api/tasks/status
+GET /api/stats
 ```
 
 ## gRPC AI 服务

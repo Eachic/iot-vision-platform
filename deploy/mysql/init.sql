@@ -55,3 +55,13 @@ CREATE TABLE IF NOT EXISTS image_tags (
   INDEX idx_image_tags_image_id (image_id),
   INDEX idx_image_tags_tag (tag)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS users (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  username VARCHAR(64) NOT NULL UNIQUE,
+  password_hash VARCHAR(128) NOT NULL,
+  role VARCHAR(32) NOT NULL,
+  created_at DATETIME(3) NULL,
+  updated_at DATETIME(3) NULL,
+  INDEX idx_users_role (role)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

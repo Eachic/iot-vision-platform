@@ -52,8 +52,17 @@ type ImageTag struct {
 	CreatedAt  time.Time `json:"created_at"`
 }
 
+type User struct {
+	ID           uint64    `gorm:"primaryKey" json:"id"`
+	Username     string    `gorm:"size:64;uniqueIndex;not null" json:"username"`
+	PasswordHash string    `gorm:"size:128;not null" json:"-"`
+	Role         string    `gorm:"size:32;not null;index" json:"role"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
 func AutoMigrate(db Migrator) error {
-	return db.AutoMigrate(&Device{}, &ImageRecord{}, &ImageTag{})
+	return db.AutoMigrate(&Device{}, &ImageRecord{}, &ImageTag{}, &User{})
 }
 
 type Migrator interface {

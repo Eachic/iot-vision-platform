@@ -51,6 +51,10 @@ services:
       REDIS_PASSWORD: ""
       STORAGE_ROOT: /app/storage
       DEVICE_TOKEN: course-demo-token
+      JWT_SECRET: course-demo-jwt-secret
+      JWT_EXPIRE_HOURS: "24"
+      DEFAULT_ADMIN_USERNAME: admin
+      DEFAULT_ADMIN_PASSWORD: admin123456
       CLOUD_API_ADDR: :8080
       EDGE_NODE_ADDR: :8081
       CLOUD_UPLOAD_URL: http://cloud-api:8080/api/images/upload

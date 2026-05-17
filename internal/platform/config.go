@@ -19,6 +19,10 @@ type Config struct {
 	AIRPCEnabled   bool
 	AIRPCAddr      string
 	AIRPCTimeout   time.Duration
+	JWTSecret      string
+	JWTExpireHours int
+	DefaultAdmin   string
+	DefaultPass    string
 	CloudAPIAddr   string
 	EdgeNodeAddr   string
 	CloudUploadURL string
@@ -36,6 +40,10 @@ func LoadConfig() Config {
 		AIRPCEnabled:   envBool("AI_RPC_ENABLED", true),
 		AIRPCAddr:      env("AI_RPC_ADDR", "127.0.0.1:9000"),
 		AIRPCTimeout:   time.Duration(envInt("AI_RPC_TIMEOUT_SECONDS", 5)) * time.Second,
+		JWTSecret:      env("JWT_SECRET", "course-demo-jwt-secret"),
+		JWTExpireHours: envInt("JWT_EXPIRE_HOURS", 24),
+		DefaultAdmin:   env("DEFAULT_ADMIN_USERNAME", "admin"),
+		DefaultPass:    env("DEFAULT_ADMIN_PASSWORD", "admin123456"),
 		CloudAPIAddr:   env("CLOUD_API_ADDR", ":8080"),
 		EdgeNodeAddr:   env("EDGE_NODE_ADDR", ":8081"),
 		CloudUploadURL: env("CLOUD_UPLOAD_URL", "http://127.0.0.1:8080/api/images/upload"),

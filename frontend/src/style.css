@@ -17,7 +17,8 @@ body {
 }
 
 button,
-select {
+select,
+input {
   font: inherit;
 }
 
@@ -29,6 +30,69 @@ button {
   display: grid;
   grid-template-columns: 248px minmax(0, 1fr);
   min-height: 100vh;
+}
+
+.auth-shell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 32px;
+}
+
+.auth-card {
+  display: grid;
+  gap: 18px;
+  width: min(440px, 92vw);
+  padding: 30px;
+  border: 1px solid #dce6f0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 24px 64px rgba(28, 45, 68, 0.14);
+}
+
+.auth-card h1 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.auth-card p {
+  margin: 6px 0 0;
+  color: #64748b;
+}
+
+.auth-card small {
+  color: #64748b;
+}
+
+.login-card .brand-logo {
+  width: 56px;
+  height: 56px;
+}
+
+.login-form {
+  display: grid;
+  gap: 14px;
+}
+
+.login-form label {
+  display: grid;
+  gap: 7px;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.login-form input {
+  height: 42px;
+  border: 1px solid #d6e0ea;
+  border-radius: 8px;
+  padding: 0 12px;
+  color: #172033;
+}
+
+.auth-notice {
+  margin-top: 0;
+  min-height: auto;
 }
 
 .app-sidebar {
