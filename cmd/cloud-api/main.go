@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -29,9 +30,11 @@ import (
 const maxUploadSize = 10 << 20
 
 type app struct {
-	cfg   platform.Config
-	db    *gorm.DB
-	redis *redis.Client
+	cfg                   platform.Config
+	db                    *gorm.DB
+	redis                 *redis.Client
+	originalMirror        platform.Storage
+	originalMirrorInitErr error
 }
 
 type imageResponse struct {
@@ -73,7 +76,8 @@ func main() {
 		rdb = nil
 	}
 
-	a := &app{cfg: cfg, db: db, redis: rdb}
+	originalMirror, originalMirrorInitErr := initOriginalMirror(cfg)
+	a := &app{cfg: cfg, db: db, redis: rdb, originalMirror: originalMirror, originalMirrorInitErr: originalMirrorInitErr}
 	if err := a.ensureDefaultAdmin(); err != nil {
 		panic(err)
 	}
@@ -112,6 +116,24 @@ func (a *app) health(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func initOriginalMirror(cfg platform.Config) (platform.Storage, error) {
+	switch strings.ToUpper(strings.TrimSpace(cfg.StorageProvider)) {
+	case "", "LOCAL":
+		log.Printf("storage provider LOCAL: originals will only be saved locally")
+		return nil, nil
+	case "HUAWEI":
+		storage, err := platform.NewHuaweiStorageFromEnv()
+		if err != nil {
+			log.Printf("storage provider HUAWEI configured but OBS mirror is unavailable: %v", err)
+			return nil, err
+		}
+		log.Printf("storage provider HUAWEI: originals will be mirrored to bucket %s", storage.Bucket())
+		return storage, nil
+	default:
+		panic("unsupported STORAGE_PROVIDER: " + cfg.StorageProvider)
+	}
 }
 
 func (a *app) ensureDefaultAdmin() error {
@@ -321,6 +343,7 @@ func (a *app) uploadImage(c *gin.Context) {
 		Status:        platform.StatusQueued,
 		CapturedAt:    capturedAt,
 	}
+	a.mirrorOriginal(c.Request.Context(), &record, originalPath, ext, size)
 
 	err = a.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&record).Error; err != nil {
@@ -353,6 +376,52 @@ func (a *app) uploadImage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"image_id": imageID, "status": platform.StatusQueued})
+}
+
+func (a *app) mirrorOriginal(ctx context.Context, record *platform.ImageRecord, originalPath string, ext string, size int64) {
+	if strings.ToUpper(strings.TrimSpace(a.cfg.StorageProvider)) != "HUAWEI" {
+		return
+	}
+	record.OriginalStorageProvider = string(platform.StorageProviderHuawei)
+	if a.originalMirrorInitErr != nil {
+		record.OriginalStorageError = a.originalMirrorInitErr.Error()
+		return
+	}
+	if a.originalMirror == nil {
+		record.OriginalStorageError = "huawei storage mirror is not initialized"
+		return
+	}
+	file, err := os.Open(originalPath)
+	if err != nil {
+		record.OriginalStorageError = err.Error()
+		return
+	}
+	defer file.Close()
+
+	objectKey := originalObjectKey(a.cfg.StorageObjectPrefix, record.ImageID, ext, time.Now())
+	contentType := mime.TypeByExtension(ext)
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	stored, err := a.originalMirror.Put(ctx, objectKey, file, platform.PutObjectOptions{
+		ContentType:   contentType,
+		ContentLength: size,
+		Metadata: map[string]string{
+			"image-id":     record.ImageID,
+			"device-id":    record.DeviceID,
+			"edge-node-id": record.EdgeNodeID,
+		},
+	})
+	if err != nil {
+		record.OriginalStorageError = err.Error()
+		log.Printf("failed to mirror original image %s to HUAWEI OBS: %v", record.ImageID, err)
+		return
+	}
+	record.OriginalStorageProvider = string(stored.Provider)
+	record.OriginalBucket = stored.Bucket
+	record.OriginalObjectKey = stored.Key
+	record.OriginalObjectURL = stored.URL
+	record.OriginalStorageError = ""
 }
 
 func (a *app) listImages(c *gin.Context) {
@@ -544,6 +613,14 @@ func imageSortOrder(value string) string {
 		return "asc"
 	}
 	return "desc"
+}
+
+func originalObjectKey(prefix string, imageID string, ext string, t time.Time) string {
+	cleanPrefix := strings.Trim(strings.ReplaceAll(prefix, "\\", "/"), "/ ")
+	if cleanPrefix == "" {
+		cleanPrefix = "original"
+	}
+	return filepath.ToSlash(filepath.Join(cleanPrefix, t.Format("2006"), t.Format("01"), t.Format("02"), imageID+ext))
 }
 
 func mapImages(images []platform.ImageRecord) []imageResponse {

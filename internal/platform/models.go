@@ -21,23 +21,28 @@ type Device struct {
 }
 
 type ImageRecord struct {
-	ID            uint64     `gorm:"primaryKey" json:"id"`
-	ImageID       string     `gorm:"size:64;uniqueIndex;not null" json:"image_id"`
-	DeviceID      string     `gorm:"size:64;not null;index" json:"device_id"`
-	EdgeNodeID    string     `gorm:"size:64;not null" json:"edge_node_id"`
-	OriginalPath  string     `gorm:"size:512;not null" json:"original_path"`
-	ThumbnailPath string     `gorm:"size:512;not null" json:"thumbnail_path"`
-	Hash          string     `gorm:"size:128;not null;index" json:"hash"`
-	Width         int        `gorm:"not null;default:0" json:"width"`
-	Height        int        `gorm:"not null;default:0" json:"height"`
-	Size          int64      `gorm:"not null;default:0" json:"size"`
-	Format        string     `gorm:"size:32;not null" json:"format"`
-	Status        string     `gorm:"size:32;not null;index" json:"status"`
-	ErrorMessage  string     `gorm:"type:text" json:"error_message"`
-	CapturedAt    *time.Time `gorm:"index" json:"captured_at"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
-	Tags          []ImageTag `gorm:"foreignKey:ImageID;references:ImageID" json:"tags"`
+	ID                      uint64     `gorm:"primaryKey" json:"id"`
+	ImageID                 string     `gorm:"size:64;uniqueIndex;not null" json:"image_id"`
+	DeviceID                string     `gorm:"size:64;not null;index" json:"device_id"`
+	EdgeNodeID              string     `gorm:"size:64;not null" json:"edge_node_id"`
+	OriginalPath            string     `gorm:"size:512;not null" json:"original_path"`
+	ThumbnailPath           string     `gorm:"size:512;not null" json:"thumbnail_path"`
+	OriginalStorageProvider string     `gorm:"size:32" json:"original_storage_provider"`
+	OriginalBucket          string     `gorm:"size:128" json:"original_bucket"`
+	OriginalObjectKey       string     `gorm:"size:512" json:"original_object_key"`
+	OriginalObjectURL       string     `gorm:"size:1024" json:"original_object_url"`
+	OriginalStorageError    string     `gorm:"type:text" json:"original_storage_error"`
+	Hash                    string     `gorm:"size:128;not null;index" json:"hash"`
+	Width                   int        `gorm:"not null;default:0" json:"width"`
+	Height                  int        `gorm:"not null;default:0" json:"height"`
+	Size                    int64      `gorm:"not null;default:0" json:"size"`
+	Format                  string     `gorm:"size:32;not null" json:"format"`
+	Status                  string     `gorm:"size:32;not null;index" json:"status"`
+	ErrorMessage            string     `gorm:"type:text" json:"error_message"`
+	CapturedAt              *time.Time `gorm:"index" json:"captured_at"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
+	Tags                    []ImageTag `gorm:"foreignKey:ImageID;references:ImageID" json:"tags"`
 }
 
 func (ImageRecord) TableName() string {

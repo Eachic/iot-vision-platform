@@ -230,6 +230,8 @@ Copy-Item .env.example .env
 MYSQL_DSN=iot_user:iot_password@tcp(127.0.0.1:3306)/iot_vision?charset=utf8mb4&parseTime=True&loc=Local
 REDIS_ADDR=127.0.0.1:6379
 STORAGE_ROOT=./storage
+STORAGE_PROVIDER=LOCAL
+STORAGE_OBJECT_PREFIX=original
 DEVICE_TOKEN=course-demo-token
 EDGE_DEDUP_ENABLED=true
 CLOUD_API_ADDR=:8080
@@ -572,6 +574,15 @@ LocalStorage   本地文件系统实现，适合课程演示和 Docker volume
 HuaweiStorage  华为云 OBS 实现，适合云端对象存储
 ```
 
+当前 `STORAGE_PROVIDER` 支持：
+
+```text
+LOCAL   只保存到本地 storage/original，保持原有链路
+HUAWEI  先保存本地，再把原图镜像上传到华为 OBS
+```
+
+第一阶段的 `HUAWEI` 不是“只使用 OBS”。worker 和前端仍继续使用本地 `original_path` 与 `/files/original/...`，这样 OBS 接入失败也不会影响课程演示主链路。
+
 Huawei OBS 环境变量示例：
 
 ```text
@@ -583,7 +594,27 @@ HUAWEI_OBS_BUCKET=你的bucket
 HUAWEI_OBS_PUBLIC_URL=https://你的bucket.obs.cn-north-4.myhuaweicloud.com
 ```
 
-目前业务主链路仍使用本地 `storage/original` 和 `storage/thumbnail` 字段。下一步迁移到 OSS 时，只需要把 `cloud-api` 保存原图、`worker` 读取原图和保存缩略图的地方切换为 `Storage` 接口，并在 MySQL 中增加 `provider/bucket/key` 字段。
+启用华为 OBS 原图镜像：
+
+```powershell
+$env:STORAGE_PROVIDER="HUAWEI"
+$env:STORAGE_OBJECT_PREFIX="original"
+docker compose up --build -d cloud-api
+```
+
+上传成功后，MySQL `images` 表会继续保存本地 `original_path`，同时写入：
+
+```text
+original_storage_provider
+original_bucket
+original_object_key
+original_object_url
+original_storage_error
+```
+
+如果 OBS 上传失败，接口仍返回 `queued`，worker 继续处理本地图片，错误信息会写入 `original_storage_error`。
+
+目前业务主链路仍使用本地 `storage/original` 和 `storage/thumbnail` 字段。下一步迁移到 OSS 时，再把 `worker` 读取原图、保存缩略图和前端图片展示切换为 `Storage` 接口或签名 URL。
 
 ## 课程要求对应关系
 

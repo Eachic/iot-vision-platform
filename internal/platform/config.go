@@ -10,43 +10,47 @@ import (
 )
 
 type Config struct {
-	MySQLDSN       string
-	RedisAddr      string
-	RedisPassword  string
-	StorageRoot    string
-	DeviceToken    string
-	EdgeDedup      bool
-	AIRPCEnabled   bool
-	AIRPCAddr      string
-	AIRPCTimeout   time.Duration
-	JWTSecret      string
-	JWTExpireHours int
-	DefaultAdmin   string
-	DefaultPass    string
-	CloudAPIAddr   string
-	EdgeNodeAddr   string
-	CloudUploadURL string
+	MySQLDSN            string
+	RedisAddr           string
+	RedisPassword       string
+	StorageRoot         string
+	StorageProvider     string
+	StorageObjectPrefix string
+	DeviceToken         string
+	EdgeDedup           bool
+	AIRPCEnabled        bool
+	AIRPCAddr           string
+	AIRPCTimeout        time.Duration
+	JWTSecret           string
+	JWTExpireHours      int
+	DefaultAdmin        string
+	DefaultPass         string
+	CloudAPIAddr        string
+	EdgeNodeAddr        string
+	CloudUploadURL      string
 }
 
 func LoadConfig() Config {
 	loadDotEnv(".env")
 	return Config{
-		MySQLDSN:       env("MYSQL_DSN", "iot_user:iot_password@tcp(127.0.0.1:3306)/iot_vision?charset=utf8mb4&parseTime=True&loc=Local"),
-		RedisAddr:      env("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPassword:  env("REDIS_PASSWORD", ""),
-		StorageRoot:    cleanPath(env("STORAGE_ROOT", "./storage")),
-		DeviceToken:    env("DEVICE_TOKEN", "course-demo-token"),
-		EdgeDedup:      envBool("EDGE_DEDUP_ENABLED", true),
-		AIRPCEnabled:   envBool("AI_RPC_ENABLED", true),
-		AIRPCAddr:      env("AI_RPC_ADDR", "127.0.0.1:9000"),
-		AIRPCTimeout:   time.Duration(envInt("AI_RPC_TIMEOUT_SECONDS", 5)) * time.Second,
-		JWTSecret:      env("JWT_SECRET", "course-demo-jwt-secret"),
-		JWTExpireHours: envInt("JWT_EXPIRE_HOURS", 24),
-		DefaultAdmin:   env("DEFAULT_ADMIN_USERNAME", "admin"),
-		DefaultPass:    env("DEFAULT_ADMIN_PASSWORD", "admin123456"),
-		CloudAPIAddr:   env("CLOUD_API_ADDR", ":8080"),
-		EdgeNodeAddr:   env("EDGE_NODE_ADDR", ":8081"),
-		CloudUploadURL: env("CLOUD_UPLOAD_URL", "http://127.0.0.1:8080/api/images/upload"),
+		MySQLDSN:            env("MYSQL_DSN", "iot_user:iot_password@tcp(127.0.0.1:3306)/iot_vision?charset=utf8mb4&parseTime=True&loc=Local"),
+		RedisAddr:           env("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPassword:       env("REDIS_PASSWORD", ""),
+		StorageRoot:         cleanPath(env("STORAGE_ROOT", "./storage")),
+		StorageProvider:     strings.ToUpper(env("STORAGE_PROVIDER", "LOCAL")),
+		StorageObjectPrefix: env("STORAGE_OBJECT_PREFIX", "original"),
+		DeviceToken:         env("DEVICE_TOKEN", "course-demo-token"),
+		EdgeDedup:           envBool("EDGE_DEDUP_ENABLED", true),
+		AIRPCEnabled:        envBool("AI_RPC_ENABLED", true),
+		AIRPCAddr:           env("AI_RPC_ADDR", "127.0.0.1:9000"),
+		AIRPCTimeout:        time.Duration(envInt("AI_RPC_TIMEOUT_SECONDS", 5)) * time.Second,
+		JWTSecret:           env("JWT_SECRET", "course-demo-jwt-secret"),
+		JWTExpireHours:      envInt("JWT_EXPIRE_HOURS", 24),
+		DefaultAdmin:        env("DEFAULT_ADMIN_USERNAME", "admin"),
+		DefaultPass:         env("DEFAULT_ADMIN_PASSWORD", "admin123456"),
+		CloudAPIAddr:        env("CLOUD_API_ADDR", ":8080"),
+		EdgeNodeAddr:        env("EDGE_NODE_ADDR", ":8081"),
+		CloudUploadURL:      env("CLOUD_UPLOAD_URL", "http://127.0.0.1:8080/api/images/upload"),
 	}
 }
 
