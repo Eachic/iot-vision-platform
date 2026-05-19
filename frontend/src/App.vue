@@ -219,11 +219,19 @@ function changePage(delta) {
 
 function imageUrl(image) {
   const path = image.thumbnail_url || image.original_url
-  return path ? `http://127.0.0.1:8080${path}` : ''
+  return apiAssetUrl(path)
 }
 
 function originalUrl(image) {
-  return image && image.original_url ? `http://127.0.0.1:8080${image.original_url}` : ''
+  return apiAssetUrl(image && image.original_url)
+}
+
+function apiAssetUrl(path) {
+  if (!path) return ''
+  if (/^https?:\/\//i.test(path)) return path
+  if (/^\/\//.test(path)) return `https:${path}`
+  if (/^[^/?#]+\.[^/?#]+/.test(path)) return `https://${path}`
+  return path.startsWith('/') ? `http://127.0.0.1:8080${path}` : `http://127.0.0.1:8080/${path}`
 }
 
 function statusText(status) {

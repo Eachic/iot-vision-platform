@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -23,6 +24,17 @@ func EnsureStorage(root string) error {
 		}
 	}
 	return nil
+}
+
+func NewStorageFromConfig(cfg Config) (Storage, error) {
+	switch strings.ToUpper(strings.TrimSpace(cfg.StorageProvider)) {
+	case "", "LOCAL":
+		return NewLocalStorage(cfg.StorageRoot, "")
+	case "HUAWEI":
+		return NewHuaweiStorageFromEnv()
+	default:
+		return nil, errors.New("unsupported STORAGE_PROVIDER: " + cfg.StorageProvider)
+	}
 }
 
 func NewID(prefix string) string {
@@ -46,6 +58,15 @@ func HashFile(path string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
+func HashReaderHex(reader io.Reader) (string, int64, error) {
+	hash := sha256.New()
+	written, err := io.Copy(hash, reader)
+	if err != nil {
+		return "", 0, err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), written, nil
+}
+
 func HashReader(reader io.Reader) (string, []byte, error) {
 	data, err := io.ReadAll(reader)
 	if err != nil {
@@ -59,5 +80,16 @@ func PublicFileURL(kind string, path string) string {
 	if path == "" {
 		return ""
 	}
-	return "/files/" + kind + "/" + filepath.Base(path)
+	normalizedKind := strings.Trim(strings.ReplaceAll(kind, "\\", "/"), "/")
+	normalizedPath := strings.TrimSpace(filepath.ToSlash(path))
+	normalizedPath = strings.TrimLeft(normalizedPath, "/")
+	prefix := normalizedKind + "/"
+	if strings.HasPrefix(normalizedPath, prefix) {
+		return "/files/" + normalizedKind + "/" + strings.TrimPrefix(normalizedPath, prefix)
+	}
+	marker := "/" + prefix
+	if idx := strings.LastIndex(normalizedPath, marker); idx >= 0 {
+		return "/files/" + normalizedKind + "/" + normalizedPath[idx+len(marker):]
+	}
+	return "/files/" + normalizedKind + "/" + filepath.Base(normalizedPath)
 }

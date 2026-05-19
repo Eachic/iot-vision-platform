@@ -1,10 +1,12 @@
 package platform
 
 import (
+	"bytes"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +26,40 @@ func DecodeImage(path string) (image.Image, string, error) {
 	return img, format, err
 }
 
+func DecodeImageReader(reader io.Reader) (image.Image, string, error) {
+	img, format, err := image.Decode(reader)
+	return img, format, err
+}
+
 func CreateThumbnail(src image.Image, dstPath string, maxWidth int) error {
+	thumb := ResizeToMaxWidth(src, maxWidth)
+	if thumb == nil {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return err
+	}
+	file, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return jpeg.Encode(file, thumb, &jpeg.Options{Quality: 82})
+}
+
+func CreateThumbnailJPEG(src image.Image, maxWidth int) ([]byte, error) {
+	thumb := ResizeToMaxWidth(src, maxWidth)
+	if thumb == nil {
+		return nil, nil
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 82}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func ResizeToMaxWidth(src image.Image, maxWidth int) image.Image {
 	bounds := src.Bounds()
 	width := bounds.Dx()
 	height := bounds.Dy()
@@ -47,15 +82,7 @@ func CreateThumbnail(src image.Image, dstPath string, maxWidth int) error {
 			dst.Set(x, y, src.At(srcX, srcY))
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
-		return err
-	}
-	file, err := os.Create(dstPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	return jpeg.Encode(file, dst, &jpeg.Options{Quality: 82})
+	return dst
 }
 
 func DetectFormatFromName(name string) string {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
@@ -53,7 +54,7 @@ func NewHuaweiStorage(cfg HuaweiStorageConfig) (*HuaweiStorage, error) {
 	return &HuaweiStorage{
 		client:    client,
 		bucket:    cfg.Bucket,
-		publicURL: strings.TrimRight(cfg.PublicURL, "/"),
+		publicURL: normalizePublicURL(cfg.PublicURL),
 	}, nil
 }
 
@@ -177,11 +178,31 @@ func (s *HuaweiStorage) PresignGet(ctx context.Context, key string, expires time
 	return output.SignedUrl, nil
 }
 
+func (s *HuaweiStorage) PublicURL(key string) string {
+	cleanKey, err := normalizeObjectKey(key)
+	if err != nil {
+		return ""
+	}
+	return s.publicObjectURL(cleanKey)
+}
+
 func (s *HuaweiStorage) publicObjectURL(key string) string {
 	if s.publicURL == "" {
 		return ""
 	}
 	return strings.TrimRight(s.publicURL, "/") + "/" + strings.TrimLeft(key, "/")
+}
+
+func normalizePublicURL(rawURL string) string {
+	value := strings.TrimRight(strings.TrimSpace(rawURL), "/")
+	if value == "" {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err == nil && parsed.Scheme != "" {
+		return value
+	}
+	return "https://" + strings.TrimLeft(value, "/")
 }
 
 func normalizeObjectKey(key string) (string, error) {

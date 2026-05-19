@@ -19,6 +19,66 @@ iot-vision-platform/
 └── .env.example
 ```
 
+## 数据流说明
+
+平台有两条核心数据流：一条是端侧设备上传图片并触发云端异步处理，另一条是用户通过 Web 前端查看图片和元数据。`STORAGE_PROVIDER` 控制业务图片实际存储位置：`LOCAL` 时使用本地 `storage` 目录，`HUAWEI` 时使用华为云 OBS。edge-node 的失败重传缓存始终保留在本地 `storage/edge-cache`，用于保证边缘节点在云端短暂不可用时仍能接收设备数据。
+
+### 端侧设备上传图片
+
+```text
+device-simulator / pressure-test
+  -> edge-node :8081 /api/edge/upload
+  -> cloud-api :8080 /api/images/upload
+  -> Storage(LOCAL 或 HUAWEI OBS)
+  -> MySQL images/devices
+  -> Redis Stream image_uploaded_stream
+  -> worker
+  -> Storage 读取原图、写入缩略图
+  -> ai-service 读取原图并生成标签
+  -> MySQL image_tags/images 状态更新
+```
+
+1. 端侧设备通过 HTTP multipart 上传图片到 `edge-node`，请求需要携带 `X-Device-Token`，并提交 `device_id`、`edge_node_id`、`captured_at` 等表单字段。
+2. `edge-node` 校验设备 token，计算图片 SHA256。启用 `EDGE_DEDUP_ENABLED=true` 时，重复图片会在边缘侧直接过滤，减少云端压力。
+3. `edge-node` 把图片转发到 `cloud-api`。如果云端暂时不可用，图片和元数据会写入本地 `storage/edge-cache`，后台重试循环会定时重新转发。
+4. `cloud-api` 再次校验设备 token，并通过统一 `Storage` 接口保存原图：
+   - `STORAGE_PROVIDER=LOCAL`：写入本地 `storage/original/...`。
+   - `STORAGE_PROVIDER=HUAWEI`：写入华为 OBS 的 `original/...` 对象。
+5. `cloud-api` 在 MySQL 中创建图片记录，状态为 `queued`，同时更新或创建设备记录。`images.original_path` 保存当前存储中的 key，OBS 模式下还会写入 `original_storage_provider`、`original_bucket`、`original_object_key`、`original_object_url` 等字段。
+6. `cloud-api` 向 Redis Stream `image_uploaded_stream` 写入任务消息，消息中包含 `image_id`、`original_path`、`device_id`、`edge_node_id` 等信息。如果 Redis 不可用，worker 会降级轮询 MySQL 中的 `queued` 任务。
+7. `worker` 消费任务后把图片状态改为 `processing`，通过统一 `Storage.Get` 读取原图，不再直接依赖本地文件路径。
+8. `worker` 解码图片、计算 hash、读取尺寸和格式，并生成 JPEG 缩略图。缩略图通过统一 `Storage.Put` 写入：
+   - `LOCAL`：本地 `storage/thumbnail/...`。
+   - `HUAWEI`：OBS 的 `thumbnail/...` 对象。
+9. `worker` 调用 `ai-service` 做标签分析。`LOCAL` 模式下传本地共享 volume 路径；`HUAWEI` 模式下优先传 OBS public URL，未配置公开 URL 时传临时签名 URL，同时在 gRPC `params` 中传递 `storage_provider` 和 `storage_key`。
+10. `ai-service` 读取图片，按当前规则分类逻辑生成标签。调用失败或超时时，worker 会降级使用 Go 本地规则标签，保证图片任务仍能完成。
+11. `worker` 把标签写入 `image_tags`，并更新 `images` 表中的 `thumbnail_path`、`width`、`height`、`format`、`size` 和状态 `completed`。失败时状态会变为 `failed`，并写入 `error_message`。
+
+### Web 前端查看图片
+
+```text
+browser(Vue :5173)
+  -> cloud-api :8080 /api/auth/login
+  -> browser localStorage 保存 JWT
+  -> cloud-api :8080 /api/images /api/devices /api/tasks/status /api/stats
+  -> MySQL 查询元数据
+  -> cloud-api 生成 original_url/thumbnail_url
+  -> browser <img> 直接请求本地静态文件或 OBS URL
+```
+
+1. 用户打开 Vue 前端并登录，前端调用 `POST /api/auth/login`。登录成功后，JWT token 保存在浏览器 `localStorage`。
+2. 前端后续请求会自动携带 `Authorization: Bearer <token>`，访问 `/api/images`、`/api/devices`、`/api/tasks/status`、`/api/stats`。
+3. `cloud-api` 校验 JWT 后从 MySQL 读取图片、设备、任务和统计元数据，并把图片记录转换为前端需要的响应结构。
+4. 对每张图片，`cloud-api` 会返回：
+   - `original_url`：原图访问地址。
+   - `thumbnail_url`：缩略图访问地址。
+5. `STORAGE_PROVIDER=LOCAL` 时，URL 形如 `/files/original/...` 或 `/files/thumbnail/...`，前端会拼接到 `http://127.0.0.1:8080`，由 `cloud-api` 的静态文件路由返回图片。
+6. `STORAGE_PROVIDER=HUAWEI` 时，URL 指向 OBS：
+   - 如果配置了 `HUAWEI_OBS_PUBLIC_URL`，后端优先返回公开访问 URL。
+   - 如果没有配置公开 URL，后端会生成临时签名 URL，适合私有桶。
+7. 前端用 `<img>` 直接加载 `thumbnail_url` 显示图库缩略图；用户点击图片后，弹窗使用 `original_url` 加载原图，并展示设备、标签、尺寸、大小、格式和采集时间。
+8. 前端每 5 秒刷新一次数据，因此图片状态会从 `queued`、`processing` 自动变为 `completed`，缩略图和标签也会在 worker 处理完成后出现在页面上。
+
 ## 环境要求
 
 Docker 部署只需要：
@@ -176,7 +236,7 @@ mysql:     127.0.0.1:3307
 redis:     127.0.0.1:6379
 ```
 
-Docker 版本还包含一个 Python `ai-service`，Worker 会通过 gRPC 调用它进行标签分析。该服务只在 Docker 内部暴露 `9000`，并通过只读共享 volume 读取 `/app/storage/original/...` 图片路径。
+Docker 版本还包含一个 Python `ai-service`，Worker 会通过 gRPC 调用它进行标签分析。`STORAGE_PROVIDER=LOCAL` 时它可继续通过只读共享 volume 读取 `/app/storage/original/...` 图片路径；`STORAGE_PROVIDER=HUAWEI` 时 Worker 会传入华为 OBS 的可访问 URL，`ai-service` 不再依赖本地原图文件。
 
 注意：Docker 内部服务仍通过 `mysql:3306` 通信；为了避免和本机 MySQL 冲突，默认把容器 MySQL 映射到宿主机 `3307`。
 
@@ -237,6 +297,7 @@ EDGE_DEDUP_ENABLED=true
 CLOUD_API_ADDR=:8080
 EDGE_NODE_ADDR=:8081
 CLOUD_UPLOAD_URL=http://127.0.0.1:8080/api/images/upload
+AI_IMAGE_FETCH_TIMEOUT_SECONDS=10
 JWT_SECRET=course-demo-jwt-secret
 JWT_EXPIRE_HOURS=24
 DEFAULT_ADMIN_USERNAME=admin
@@ -577,11 +638,11 @@ HuaweiStorage  华为云 OBS 实现，适合云端对象存储
 当前 `STORAGE_PROVIDER` 支持：
 
 ```text
-LOCAL   只保存到本地 storage/original，保持原有链路
-HUAWEI  先保存本地，再把原图镜像上传到华为 OBS
+LOCAL   业务图片保存到本地 storage/original 与 storage/thumbnail
+HUAWEI  业务原图和缩略图保存到华为 OBS，worker 与 ai-service 从 OBS 读取原图
 ```
 
-第一阶段的 `HUAWEI` 不是“只使用 OBS”。worker 和前端仍继续使用本地 `original_path` 与 `/files/original/...`，这样 OBS 接入失败也不会影响课程演示主链路。
+`STORAGE_PROVIDER` 是业务图片通道的统一开关。edge-node 的失败重传缓存和去重记录仍保留在本地 `storage/edge-cache`，用于维持边缘节点的离线缓存能力。
 
 Huawei OBS 环境变量示例：
 
@@ -594,7 +655,7 @@ HUAWEI_OBS_BUCKET=你的bucket
 HUAWEI_OBS_PUBLIC_URL=https://你的bucket.obs.cn-north-4.myhuaweicloud.com
 ```
 
-启用华为 OBS 原图镜像：
+启用华为 OBS 作为业务图片存储：
 
 ```powershell
 $env:STORAGE_PROVIDER="HUAWEI"
@@ -602,7 +663,7 @@ $env:STORAGE_OBJECT_PREFIX="original"
 docker compose up --build -d cloud-api
 ```
 
-上传成功后，MySQL `images` 表会继续保存本地 `original_path`，同时写入：
+上传成功后，MySQL `images` 表会保存当前存储中的 `original_path`。在 OBS 模式下，它是对象 key，同时还会写入：
 
 ```text
 original_storage_provider
@@ -612,9 +673,7 @@ original_object_url
 original_storage_error
 ```
 
-如果 OBS 上传失败，接口仍返回 `queued`，worker 继续处理本地图片，错误信息会写入 `original_storage_error`。
-
-目前业务主链路仍使用本地 `storage/original` 和 `storage/thumbnail` 字段。下一步迁移到 OSS 时，再把 `worker` 读取原图、保存缩略图和前端图片展示切换为 `Storage` 接口或签名 URL。
+启用后，cloud-api 会把上传原图写入 OBS，worker 从 OBS 拉取原图并把缩略图写回 OBS；前端图片 URL 优先使用公开 URL，未配置 `HUAWEI_OBS_PUBLIC_URL` 时由后端生成临时签名 URL。
 
 ## 课程要求对应关系
 

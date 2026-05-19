@@ -1,8 +1,11 @@
-﻿import logging
+import logging
 import os
 import time
 from concurrent import futures
+from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 import grpc
 from PIL import Image
@@ -18,11 +21,10 @@ def analyze_image(request, context):
     started = time.perf_counter()
     image_uri = request.image_uri
     image_id = request.image_id
-    filename = request.filename or Path(image_uri).name
+    filename = request.filename or Path(urlparse(image_uri).path or image_uri).name
 
     try:
-        image_path = resolve_image_uri(image_uri)
-        with Image.open(image_path) as img:
+        with open_image(request) as img:
             rgb = img.convert("RGB")
             tags = generate_tags(rgb, filename)
     except Exception as exc:
@@ -48,13 +50,31 @@ def analyze_image(request, context):
     )
 
 
-def resolve_image_uri(image_uri):
+def open_image(request):
+    image_uri = request.image_uri
+    parsed = urlparse(image_uri)
+    if parsed.scheme in ("http", "https"):
+        req = Request(image_uri, headers={"User-Agent": "iot-vision-ai-service/1.0"})
+        timeout = float(os.getenv("AI_IMAGE_FETCH_TIMEOUT_SECONDS", "10"))
+        with urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        return Image.open(BytesIO(data))
+
+    image_path = resolve_local_image_uri(image_uri)
+    return Image.open(image_path)
+
+
+def resolve_local_image_uri(image_uri):
     if not image_uri:
         raise ValueError("image_uri is required")
     if image_uri.startswith("file://"):
         image_uri = image_uri[len("file://") :]
     if "://" in image_uri:
-        raise ValueError("only local shared-volume paths are supported in this MVP")
+        provider = os.getenv("STORAGE_PROVIDER", "LOCAL").upper()
+        raise ValueError(
+            f"unsupported image_uri for STORAGE_PROVIDER={provider}; "
+            "expected a local path or http(s) URL"
+        )
     path = Path(image_uri)
     if not path.exists():
         raise FileNotFoundError(path)

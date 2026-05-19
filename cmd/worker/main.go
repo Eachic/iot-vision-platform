@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"image"
+	"io"
 	"log"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"iot-vision-platform/internal/platform"
@@ -18,6 +21,7 @@ type worker struct {
 	db       *gorm.DB
 	redis    *redis.Client
 	cfg      platform.Config
+	storage  platform.Storage
 	name     string
 	analyzer platform.VisionAnalyzer
 }
@@ -32,6 +36,11 @@ func main() {
 		panic(err)
 	}
 	rdb := platform.OpenRedis(cfg)
+	storage, err := platform.NewStorageFromConfig(cfg)
+	if err != nil {
+		panic(err)
+	}
+	log.Printf("storage provider %s bucket=%s", storage.Provider(), storage.Bucket())
 	ctx := context.Background()
 	useRedis := true
 	if err := platform.PingRedis(ctx, rdb); err != nil {
@@ -39,7 +48,7 @@ func main() {
 		useRedis = false
 	}
 
-	w := &worker{db: db, redis: rdb, cfg: cfg, name: "worker-" + platform.NewID("node")}
+	w := &worker{db: db, redis: rdb, cfg: cfg, storage: storage, name: "worker-" + platform.NewID("node")}
 	if cfg.AIRPCEnabled {
 		analyzer, err := platform.NewGRPCVisionAnalyzer(cfg.AIRPCAddr)
 		if err != nil {
@@ -99,7 +108,7 @@ func (w *worker) consume(ctx context.Context) error {
 
 func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 	imageID := value(msg, "image_id")
-	originalPath := filepath.FromSlash(value(msg, "original_path"))
+	originalPath := value(msg, "original_path")
 	originalName := value(msg, "original_name")
 	if originalName == "" {
 		originalName = filepath.Base(originalPath)
@@ -114,23 +123,55 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 		return err
 	}
 
-	img, format, err := platform.DecodeImage(originalPath)
+	var record platform.ImageRecord
+	if err := w.db.Where("image_id = ?", imageID).First(&record).Error; err != nil {
+		w.markFailed(imageID, err)
+		return err
+	}
+	originalKey := w.storageKey(record.OriginalPath, record.OriginalObjectKey)
+	reader, _, err := w.storage.Get(ctx, originalKey)
+	if err != nil {
+		w.markFailed(imageID, err)
+		return err
+	}
+	originalBytes, err := io.ReadAll(reader)
+	closeErr := reader.Close()
+	if err != nil {
+		w.markFailed(imageID, err)
+		return err
+	}
+	if closeErr != nil {
+		w.markFailed(imageID, closeErr)
+		return closeErr
+	}
+	hash, size, err := platform.HashReaderHex(bytes.NewReader(originalBytes))
+	if err != nil {
+		w.markFailed(imageID, err)
+		return err
+	}
+	img, format, err := platform.DecodeImageReader(bytes.NewReader(originalBytes))
 	if err != nil {
 		w.markFailed(imageID, err)
 		return err
 	}
 	bounds := img.Bounds()
-	thumbPath := filepath.Join(w.cfg.StorageRoot, "thumbnail", imageID+".jpg")
-	if err := platform.CreateThumbnail(img, thumbPath, 360); err != nil {
-		w.markFailed(imageID, err)
-		return err
-	}
-	hash, err := platform.HashFile(originalPath)
+	thumbBytes, err := platform.CreateThumbnailJPEG(img, 360)
 	if err != nil {
 		w.markFailed(imageID, err)
 		return err
 	}
-	tags := w.analyzeTags(ctx, imageID, originalPath, originalName, img)
+	thumbKey := filepath.ToSlash(filepath.Join("thumbnail", imageID+".jpg"))
+	if _, err := w.storage.Put(ctx, thumbKey, bytes.NewReader(thumbBytes), platform.PutObjectOptions{
+		ContentType:   "image/jpeg",
+		ContentLength: int64(len(thumbBytes)),
+		Metadata: map[string]string{
+			"image-id": imageID,
+		},
+	}); err != nil {
+		w.markFailed(imageID, err)
+		return err
+	}
+	tags := w.analyzeTags(ctx, imageID, originalKey, originalName, format, img)
 	err = w.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("image_id = ?", imageID).Delete(&platform.ImageTag{}).Error; err != nil {
 			return err
@@ -145,10 +186,11 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 			}
 		}
 		return tx.Model(&platform.ImageRecord{}).Where("image_id = ?", imageID).Updates(map[string]interface{}{
-			"thumbnail_path": filepath.ToSlash(thumbPath),
+			"thumbnail_path": thumbKey,
 			"hash":           hash,
 			"width":          bounds.Dx(),
 			"height":         bounds.Dy(),
+			"size":           size,
 			"format":         format,
 			"status":         platform.StatusCompleted,
 			"error_message":  "",
@@ -157,19 +199,24 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 	return err
 }
 
-func (w *worker) analyzeTags(ctx context.Context, imageID string, originalPath string, originalName string, img image.Image) []platform.GeneratedTag {
+func (w *worker) analyzeTags(ctx context.Context, imageID string, originalKey string, originalName string, format string, img image.Image) []platform.GeneratedTag {
 	if w.analyzer == nil {
 		return platform.GenerateTags(img, originalName)
 	}
 	aiCtx, cancel := context.WithTimeout(ctx, w.cfg.AIRPCTimeout)
 	defer cancel()
+	imageURI := w.aiImageURI(aiCtx, originalKey)
 	tags, err := w.analyzer.Analyze(aiCtx, platform.AnalyzeImageRequest{
 		RequestID:   platform.NewID("ai_req"),
 		ImageID:     imageID,
-		ImageURI:    filepath.ToSlash(originalPath),
+		ImageURI:    imageURI,
 		Filename:    originalName,
-		ContentType: "image/" + platform.DetectFormatFromName(originalName),
+		ContentType: "image/" + format,
 		Tasks:       []platform.AnalysisTask{{Type: "classification"}},
+		Params: map[string]string{
+			"storage_provider": string(w.storage.Provider()),
+			"storage_key":      originalKey,
+		},
 	})
 	if err != nil {
 		log.Printf("ai analyze failed image=%s err=%v; fallback to local tags", imageID, err)
@@ -204,6 +251,38 @@ func (w *worker) markFailed(imageID string, err error) {
 		"status":        platform.StatusFailed,
 		"error_message": err.Error(),
 	}).Error
+}
+
+func (w *worker) storageKey(pathOrKey string, objectKey string) string {
+	key := strings.TrimSpace(objectKey)
+	if key == "" {
+		key = strings.TrimSpace(filepath.ToSlash(pathOrKey))
+	}
+	if w.storage.Provider() != platform.StorageProviderLocal {
+		return key
+	}
+	root := strings.TrimRight(filepath.ToSlash(w.cfg.StorageRoot), "/") + "/"
+	if strings.HasPrefix(key, root) {
+		return strings.TrimPrefix(key, root)
+	}
+	return strings.TrimLeft(key, "/")
+}
+
+func (w *worker) aiImageURI(ctx context.Context, originalKey string) string {
+	if w.storage.Provider() == platform.StorageProviderLocal {
+		return filepath.ToSlash(filepath.Join(w.cfg.StorageRoot, filepath.FromSlash(originalKey)))
+	}
+	if publicStorage, ok := w.storage.(interface{ PublicURL(string) string }); ok {
+		if publicURL := publicStorage.PublicURL(originalKey); publicURL != "" {
+			return publicURL
+		}
+	}
+	url, err := w.storage.PresignGet(ctx, originalKey, w.cfg.AIRPCTimeout+time.Minute)
+	if err != nil {
+		log.Printf("failed to presign original image %s for ai-service: %v", originalKey, err)
+		return originalKey
+	}
+	return url
 }
 
 func value(msg redis.XMessage, key string) string {

@@ -16,3 +16,5 @@ ai-service/__pycache__/
 *.log
 
 tools/
+
+*.pdf

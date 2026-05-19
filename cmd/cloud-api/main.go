@@ -13,7 +13,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"os"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -30,11 +30,10 @@ import (
 const maxUploadSize = 10 << 20
 
 type app struct {
-	cfg                   platform.Config
-	db                    *gorm.DB
-	redis                 *redis.Client
-	originalMirror        platform.Storage
-	originalMirrorInitErr error
+	cfg     platform.Config
+	db      *gorm.DB
+	redis   *redis.Client
+	storage platform.Storage
 }
 
 type imageResponse struct {
@@ -76,8 +75,12 @@ func main() {
 		rdb = nil
 	}
 
-	originalMirror, originalMirrorInitErr := initOriginalMirror(cfg)
-	a := &app{cfg: cfg, db: db, redis: rdb, originalMirror: originalMirror, originalMirrorInitErr: originalMirrorInitErr}
+	storage, err := platform.NewStorageFromConfig(cfg)
+	if err != nil {
+		panic(err)
+	}
+	log.Printf("storage provider %s bucket=%s", storage.Provider(), storage.Bucket())
+	a := &app{cfg: cfg, db: db, redis: rdb, storage: storage}
 	if err := a.ensureDefaultAdmin(); err != nil {
 		panic(err)
 	}
@@ -116,24 +119,6 @@ func (a *app) health(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
-}
-
-func initOriginalMirror(cfg platform.Config) (platform.Storage, error) {
-	switch strings.ToUpper(strings.TrimSpace(cfg.StorageProvider)) {
-	case "", "LOCAL":
-		log.Printf("storage provider LOCAL: originals will only be saved locally")
-		return nil, nil
-	case "HUAWEI":
-		storage, err := platform.NewHuaweiStorageFromEnv()
-		if err != nil {
-			log.Printf("storage provider HUAWEI configured but OBS mirror is unavailable: %v", err)
-			return nil, err
-		}
-		log.Printf("storage provider HUAWEI: originals will be mirrored to bucket %s", storage.Bucket())
-		return storage, nil
-	default:
-		panic("unsupported STORAGE_PROVIDER: " + cfg.StorageProvider)
-	}
 }
 
 func (a *app) ensureDefaultAdmin() error {
@@ -322,8 +307,16 @@ func (a *app) uploadImage(c *gin.Context) {
 
 	imageID := platform.NewID("img")
 	ext := strings.ToLower(filepath.Ext(file.Filename))
-	originalPath := filepath.Join(a.cfg.StorageRoot, "original", imageID+ext)
-	hashValue, size, err := saveUploadedFile(file, originalPath)
+	objectPrefix := a.cfg.StorageObjectPrefix
+	if a.storage.Provider() == platform.StorageProviderLocal {
+		objectPrefix = "original"
+	}
+	objectKey := originalObjectKey(objectPrefix, imageID, ext, time.Now())
+	stored, hashValue, size, err := saveUploadedObject(c.Request.Context(), a.storage, file, objectKey, contentTypeForExt(ext), map[string]string{
+		"image-id":     imageID,
+		"device-id":    deviceID,
+		"edge-node-id": edgeNodeID,
+	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -332,18 +325,21 @@ func (a *app) uploadImage(c *gin.Context) {
 	capturedAt := parseTime(c.PostForm("captured_at"))
 	now := time.Now()
 	record := platform.ImageRecord{
-		ImageID:       imageID,
-		DeviceID:      deviceID,
-		EdgeNodeID:    edgeNodeID,
-		OriginalPath:  filepath.ToSlash(originalPath),
-		ThumbnailPath: "",
-		Hash:          hashValue,
-		Size:          size,
-		Format:        platform.DetectFormatFromName(file.Filename),
-		Status:        platform.StatusQueued,
-		CapturedAt:    capturedAt,
+		ImageID:                 imageID,
+		DeviceID:                deviceID,
+		EdgeNodeID:              edgeNodeID,
+		OriginalPath:            stored.Key,
+		ThumbnailPath:           "",
+		OriginalStorageProvider: string(stored.Provider),
+		OriginalBucket:          stored.Bucket,
+		OriginalObjectKey:       stored.Key,
+		OriginalObjectURL:       stored.URL,
+		Hash:                    hashValue,
+		Size:                    size,
+		Format:                  platform.DetectFormatFromName(file.Filename),
+		Status:                  platform.StatusQueued,
+		CapturedAt:              capturedAt,
 	}
-	a.mirrorOriginal(c.Request.Context(), &record, originalPath, ext, size)
 
 	err = a.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&record).Error; err != nil {
@@ -376,52 +372,6 @@ func (a *app) uploadImage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"image_id": imageID, "status": platform.StatusQueued})
-}
-
-func (a *app) mirrorOriginal(ctx context.Context, record *platform.ImageRecord, originalPath string, ext string, size int64) {
-	if strings.ToUpper(strings.TrimSpace(a.cfg.StorageProvider)) != "HUAWEI" {
-		return
-	}
-	record.OriginalStorageProvider = string(platform.StorageProviderHuawei)
-	if a.originalMirrorInitErr != nil {
-		record.OriginalStorageError = a.originalMirrorInitErr.Error()
-		return
-	}
-	if a.originalMirror == nil {
-		record.OriginalStorageError = "huawei storage mirror is not initialized"
-		return
-	}
-	file, err := os.Open(originalPath)
-	if err != nil {
-		record.OriginalStorageError = err.Error()
-		return
-	}
-	defer file.Close()
-
-	objectKey := originalObjectKey(a.cfg.StorageObjectPrefix, record.ImageID, ext, time.Now())
-	contentType := mime.TypeByExtension(ext)
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	stored, err := a.originalMirror.Put(ctx, objectKey, file, platform.PutObjectOptions{
-		ContentType:   contentType,
-		ContentLength: size,
-		Metadata: map[string]string{
-			"image-id":     record.ImageID,
-			"device-id":    record.DeviceID,
-			"edge-node-id": record.EdgeNodeID,
-		},
-	})
-	if err != nil {
-		record.OriginalStorageError = err.Error()
-		log.Printf("failed to mirror original image %s to HUAWEI OBS: %v", record.ImageID, err)
-		return
-	}
-	record.OriginalStorageProvider = string(stored.Provider)
-	record.OriginalBucket = stored.Bucket
-	record.OriginalObjectKey = stored.Key
-	record.OriginalObjectURL = stored.URL
-	record.OriginalStorageError = ""
 }
 
 func (a *app) listImages(c *gin.Context) {
@@ -460,7 +410,7 @@ func (a *app) listImages(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": mapImages(images), "total": total, "page": page, "page_size": pageSize, "sort_by": sortBy, "sort_order": sortOrder})
+	c.JSON(http.StatusOK, gin.H{"items": a.mapImages(c.Request.Context(), images), "total": total, "page": page, "page_size": pageSize, "sort_by": sortBy, "sort_order": sortOrder})
 }
 
 func (a *app) getImage(c *gin.Context) {
@@ -473,7 +423,7 @@ func (a *app) getImage(c *gin.Context) {
 		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, mapImage(image))
+	c.JSON(http.StatusOK, a.mapImage(c.Request.Context(), image))
 }
 
 func (a *app) listDevices(c *gin.Context) {
@@ -507,7 +457,7 @@ func (a *app) taskStatus(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"counts": counts, "recent": mapImages(recent)})
+	c.JSON(http.StatusOK, gin.H{"counts": counts, "recent": a.mapImages(c.Request.Context(), recent)})
 }
 
 func (a *app) stats(c *gin.Context) {
@@ -545,26 +495,28 @@ func (a *app) enqueueImage(ctx context.Context, record platform.ImageRecord) err
 	}).Err()
 }
 
-func saveUploadedFile(fileHeader *multipart.FileHeader, path string) (string, int64, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return "", 0, err
-	}
+func saveUploadedObject(ctx context.Context, storage platform.Storage, fileHeader *multipart.FileHeader, key string, contentType string, metadata map[string]string) (platform.StoredObject, string, int64, error) {
 	src, err := fileHeader.Open()
 	if err != nil {
-		return "", 0, err
+		return platform.StoredObject{}, "", 0, err
 	}
 	defer src.Close()
-	dst, err := os.Create(path)
-	if err != nil {
-		return "", 0, err
-	}
-	defer dst.Close()
+
 	hash := sha256.New()
-	written, err := io.Copy(io.MultiWriter(dst, hash), src)
+	body := io.TeeReader(src, hash)
+	stored, err := storage.Put(ctx, key, body, platform.PutObjectOptions{
+		ContentType:   contentType,
+		ContentLength: fileHeader.Size,
+		Metadata:      metadata,
+	})
 	if err != nil {
-		return "", 0, err
+		return platform.StoredObject{}, "", 0, err
 	}
-	return hex.EncodeToString(hash.Sum(nil)), written, nil
+	size := stored.Size
+	if size <= 0 {
+		size = fileHeader.Size
+	}
+	return stored, hex.EncodeToString(hash.Sum(nil)), size, nil
 }
 
 func isAllowedImage(file *multipart.FileHeader) bool {
@@ -623,18 +575,68 @@ func originalObjectKey(prefix string, imageID string, ext string, t time.Time) s
 	return filepath.ToSlash(filepath.Join(cleanPrefix, t.Format("2006"), t.Format("01"), t.Format("02"), imageID+ext))
 }
 
-func mapImages(images []platform.ImageRecord) []imageResponse {
+func contentTypeForExt(ext string) string {
+	contentType := mime.TypeByExtension(ext)
+	if contentType == "" {
+		return "application/octet-stream"
+	}
+	return contentType
+}
+
+func (a *app) mapImages(ctx context.Context, images []platform.ImageRecord) []imageResponse {
 	result := make([]imageResponse, 0, len(images))
 	for _, image := range images {
-		result = append(result, mapImage(image))
+		result = append(result, a.mapImage(ctx, image))
 	}
 	return result
 }
 
-func mapImage(image platform.ImageRecord) imageResponse {
+func (a *app) mapImage(ctx context.Context, image platform.ImageRecord) imageResponse {
 	return imageResponse{
 		ImageRecord:  image,
-		OriginalURL:  platform.PublicFileURL("original", image.OriginalPath),
-		ThumbnailURL: platform.PublicFileURL("thumbnail", image.ThumbnailPath),
+		OriginalURL:  a.objectURL(ctx, "original", image.OriginalPath, image.OriginalObjectKey, image.OriginalObjectURL),
+		ThumbnailURL: a.objectURL(ctx, "thumbnail", image.ThumbnailPath, image.ThumbnailPath, ""),
 	}
+}
+
+func (a *app) objectURL(ctx context.Context, kind string, pathOrKey string, objectKey string, storedURL string) string {
+	if storedURL != "" {
+		return normalizeStoredURL(storedURL)
+	}
+	key := strings.TrimSpace(objectKey)
+	if key == "" {
+		key = strings.TrimSpace(pathOrKey)
+	}
+	if key == "" {
+		return ""
+	}
+	if a.storage == nil || a.storage.Provider() == platform.StorageProviderLocal {
+		return platform.PublicFileURL(kind, key)
+	}
+	if publicStorage, ok := a.storage.(interface{ PublicURL(string) string }); ok {
+		if publicURL := publicStorage.PublicURL(key); publicURL != "" {
+			return publicURL
+		}
+	}
+	url, err := a.storage.PresignGet(ctx, key, time.Hour)
+	if err != nil {
+		log.Printf("failed to presign %s object %s: %v", kind, key, err)
+		return ""
+	}
+	return url
+}
+
+func normalizeStoredURL(rawURL string) string {
+	value := strings.TrimSpace(rawURL)
+	if value == "" {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err == nil && parsed.Scheme != "" {
+		return value
+	}
+	if strings.Contains(value, ".") && !strings.HasPrefix(value, "/") {
+		return "https://" + strings.TrimLeft(value, "/")
+	}
+	return value
 }
