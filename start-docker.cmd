@@ -13,8 +13,11 @@ echo   docker compose ps
 echo.
 echo Frontend:
 echo   http://127.0.0.1:5173
-echo Cloud API:
-echo   http://127.0.0.1:8080/api/health
+echo API Gateway health:
+echo   http://127.0.0.1:5173/api/health
+echo.
+echo To scale cloud-api after startup:
+echo   docker compose up -d --scale cloud-api=3 cloud-api frontend
 echo.
 echo To start one simulator container:
 echo   docker compose --profile simulator up --build -d simulator

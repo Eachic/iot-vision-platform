@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import axios from 'axios'
 
 const api = axios.create({
-  baseURL: 'http://127.0.0.1:8080/api',
+  baseURL: '/api',
   timeout: 8000
 })
 
@@ -231,7 +231,7 @@ function apiAssetUrl(path) {
   if (/^https?:\/\//i.test(path)) return path
   if (/^\/\//.test(path)) return `https:${path}`
   if (/^[^/?#]+\.[^/?#]+/.test(path)) return `https://${path}`
-  return path.startsWith('/') ? `http://127.0.0.1:8080${path}` : `http://127.0.0.1:8080/${path}`
+  return path.startsWith('/') ? path : `/${path}`
 }
 
 function statusText(status) {
@@ -350,7 +350,7 @@ onBeforeUnmount(() => {
 
       <section v-if="apiError" class="notice">
         <strong>后端 API 暂时不可用</strong>
-        <span>{{ apiError }}。请确认 cloud-api.exe 正在运行并监听 8080。</span>
+        <span>{{ apiError }}。请确认 nginx 网关和 cloud-api 正在运行。</span>
       </section>
 
       <section class="metric-grid">

@@ -43,6 +43,11 @@ PRESETS = {
     },
 }
 
+TARGETS = {
+    "edge": "http://127.0.0.1:8081/api/edge/upload",
+    "gateway": "http://127.0.0.1:5173/api/images/upload",
+}
+
 
 class Metrics:
     """线程安全的压测指标收集器。
@@ -208,7 +213,7 @@ def upload_once(session, target, token, path, device_id, edge_node_id, timeout):
     return resp.status_code, latency
 
 
-def worker_loop(worker_id, args, images, stop_at, metrics):
+def worker_loop(worker_id, args, target, images, stop_at, metrics):
     """单个压测线程的循环。
 
     每个线程模拟一台设备，不断从生成的图片集中随机选图并上传，直到到达 stop_at。
@@ -222,7 +227,7 @@ def worker_loop(worker_id, args, images, stop_at, metrics):
         try:
             status_code, latency = upload_once(
                 session=session,
-                target=args.target,
+                target=target,
                 token=args.token,
                 path=path,
                 device_id=device_id,
@@ -249,7 +254,13 @@ def parse_args():
     mode.add_argument("--mid", action="store_true", help="50 workers, 60 seconds, medium images.")
     mode.add_argument("--high", action="store_true", help="100 workers, 120 seconds, large images.")
 
-    parser.add_argument("--target", default="http://127.0.0.1:8081/api/edge/upload")
+    parser.add_argument(
+        "--route",
+        choices=sorted(TARGETS),
+        default="edge",
+        help="Upload route: edge uses device -> edge-node -> nginx -> cloud-api; gateway uploads directly through nginx.",
+    )
+    parser.add_argument("--target", help="Override upload URL. Defaults to --route edge/gateway.")
     parser.add_argument("--token", default="course-demo-token")
     parser.add_argument("--edge-node-id", default="edge_pressure")
     parser.add_argument("--device-prefix", default="pressure_device")
@@ -291,6 +302,12 @@ def choose_preset(args):
     return name, preset
 
 
+def resolve_target(args):
+    if args.target:
+        return args.target
+    return TARGETS[args.route]
+
+
 def main():
     """压测入口：
 
@@ -302,6 +319,7 @@ def main():
     """
     args = parse_args()
     preset_name, preset = choose_preset(args)
+    target = resolve_target(args)
     image_dir = Path(args.image_dir)
     images = ensure_images(
         image_dir=image_dir,
@@ -314,12 +332,17 @@ def main():
 
     print("IoT Vision pressure upload")
     print(f"mode:         {preset_name}")
-    print(f"target:       {args.target}")
+    print(f"route:        {args.route}")
+    print(f"target:       {target}")
     print(f"workers:      {preset['workers']}")
     print(f"duration:     {preset['duration']}s")
     print(f"images:       {len(images)} files, {preset['width']}x{preset['height']}")
     print(f"image dir:    {image_dir.resolve()}")
-    print("Tip: use start-docker-pressure.cmd first so edge deduplication is disabled.\n")
+    if args.route == "edge":
+        print("Tip: use start-docker-pressure.cmd first so edge deduplication is disabled.")
+    else:
+        print("Tip: gateway route bypasses edge-node and uploads directly to cloud-api through nginx.")
+    print()
 
     metrics = Metrics()
     started_at = time.perf_counter()
@@ -328,7 +351,7 @@ def main():
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=preset["workers"]) as executor:
         futures = [
-            executor.submit(worker_loop, idx + 1, args, images, stop_at, metrics)
+            executor.submit(worker_loop, idx + 1, args, target, images, stop_at, metrics)
             for idx in range(preset["workers"])
         ]
         while time.perf_counter() < stop_at:

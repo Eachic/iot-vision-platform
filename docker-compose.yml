@@ -43,7 +43,6 @@ services:
         SERVICE: cloud-api
         GOPROXY: https://goproxy.cn,direct
         IMAGE_REGISTRY: docker.m.daocloud.io/library
-    container_name: iot-vision-cloud-api
     restart: unless-stopped
     environment:
       MYSQL_DSN: iot_user:iot_password@tcp(mysql:3306)/iot_vision?charset=utf8mb4&parseTime=True&loc=Local
@@ -65,10 +64,10 @@ services:
       HUAWEI_OBS_PUBLIC_URL: ${HUAWEI_OBS_PUBLIC_URL:-}
       CLOUD_API_ADDR: :8080
       EDGE_NODE_ADDR: :8081
-      CLOUD_UPLOAD_URL: http://cloud-api:8080/api/images/upload
+      CLOUD_UPLOAD_URL: http://frontend/api/images/upload
       TZ: Asia/Shanghai
-    ports:
-      - "8080:8080"
+    expose:
+      - "8080"
     volumes:
       - app-storage:/app/storage
     depends_on:
@@ -158,14 +157,14 @@ services:
       DEVICE_TOKEN: course-demo-token
       EDGE_DEDUP_ENABLED: "false"
       EDGE_NODE_ADDR: :8081
-      CLOUD_UPLOAD_URL: http://cloud-api:8080/api/images/upload
+      CLOUD_UPLOAD_URL: http://frontend/api/images/upload
       TZ: Asia/Shanghai
     ports:
       - "8081:8081"
     volumes:
       - app-storage:/app/storage
     depends_on:
-      cloud-api:
+      frontend:
         condition: service_healthy
 
   frontend:
@@ -181,6 +180,11 @@ services:
     depends_on:
       cloud-api:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 8s
+      timeout: 3s
+      retries: 20
 
   simulator:
     build:

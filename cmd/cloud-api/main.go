@@ -29,6 +29,16 @@ import (
 
 const maxUploadSize = 10 << 20
 
+const (
+	cacheKeyStats       = "cache:cloud-api:stats"
+	cacheKeyTasksStatus = "cache:cloud-api:tasks_status"
+	cacheKeyDevices     = "cache:cloud-api:devices"
+
+	statsCacheTTL       = 5 * time.Second
+	tasksStatusCacheTTL = 2 * time.Second
+	devicesCacheTTL     = 10 * time.Second
+)
+
 type app struct {
 	cfg     platform.Config
 	db      *gorm.DB
@@ -371,6 +381,7 @@ func (a *app) uploadImage(c *gin.Context) {
 		return
 	}
 
+	a.invalidateDashboardCache(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{"image_id": imageID, "status": platform.StatusQueued})
 }
 
@@ -427,55 +438,117 @@ func (a *app) getImage(c *gin.Context) {
 }
 
 func (a *app) listDevices(c *gin.Context) {
-	type row struct {
-		platform.Device
-		ImageCount int64 `json:"image_count"`
-	}
-	var devices []platform.Device
-	if err := a.db.Order("last_seen desc").Find(&devices).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	rows := make([]row, 0, len(devices))
-	for _, device := range devices {
-		var count int64
-		_ = a.db.Model(&platform.ImageRecord{}).Where("device_id = ?", device.DeviceID).Count(&count).Error
-		rows = append(rows, row{Device: device, ImageCount: count})
-	}
-	c.JSON(http.StatusOK, gin.H{"items": rows})
+	a.cachedJSON(c, cacheKeyDevices, devicesCacheTTL, func(ctx context.Context) (gin.H, error) {
+		type imageCount struct {
+			DeviceID string
+			Count    int64
+		}
+		type row struct {
+			platform.Device
+			ImageCount int64 `json:"image_count"`
+		}
+		var devices []platform.Device
+		if err := a.db.Order("last_seen desc").Find(&devices).Error; err != nil {
+			return nil, err
+		}
+		var counts []imageCount
+		if err := a.db.Model(&platform.ImageRecord{}).Select("device_id, count(*) as count").Group("device_id").Scan(&counts).Error; err != nil {
+			return nil, err
+		}
+		countByDevice := make(map[string]int64, len(counts))
+		for _, count := range counts {
+			countByDevice[count.DeviceID] = count.Count
+		}
+		rows := make([]row, 0, len(devices))
+		for _, device := range devices {
+			rows = append(rows, row{Device: device, ImageCount: countByDevice[device.DeviceID]})
+		}
+		return gin.H{"items": rows}, nil
+	})
 }
 
 func (a *app) taskStatus(c *gin.Context) {
-	counts := map[string]int64{}
-	for _, status := range []string{platform.StatusQueued, platform.StatusProcessing, platform.StatusCompleted, platform.StatusFailed} {
-		var count int64
-		_ = a.db.Model(&platform.ImageRecord{}).Where("status = ?", status).Count(&count).Error
-		counts[status] = count
-	}
-	var recent []platform.ImageRecord
-	if err := a.db.Preload("Tags").Order("updated_at desc").Limit(12).Find(&recent).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"counts": counts, "recent": a.mapImages(c.Request.Context(), recent)})
+	a.cachedJSON(c, cacheKeyTasksStatus, tasksStatusCacheTTL, func(ctx context.Context) (gin.H, error) {
+		counts := map[string]int64{}
+		for _, status := range []string{platform.StatusQueued, platform.StatusProcessing, platform.StatusCompleted, platform.StatusFailed} {
+			var count int64
+			if err := a.db.Model(&platform.ImageRecord{}).Where("status = ?", status).Count(&count).Error; err != nil {
+				return nil, err
+			}
+			counts[status] = count
+		}
+		var recent []platform.ImageRecord
+		if err := a.db.Preload("Tags").Order("updated_at desc").Limit(12).Find(&recent).Error; err != nil {
+			return nil, err
+		}
+		return gin.H{"counts": counts, "recent": a.mapImages(ctx, recent)}, nil
+	})
 }
 
 func (a *app) stats(c *gin.Context) {
-	var imageCount int64
-	var deviceCount int64
-	var todayCount int64
-	today := time.Now().Format("2006-01-02")
-	_ = a.db.Model(&platform.ImageRecord{}).Count(&imageCount).Error
-	_ = a.db.Model(&platform.Device{}).Count(&deviceCount).Error
-	_ = a.db.Model(&platform.ImageRecord{}).Where("created_at >= ?", today).Count(&todayCount).Error
+	a.cachedJSON(c, cacheKeyStats, statsCacheTTL, func(ctx context.Context) (gin.H, error) {
+		var imageCount int64
+		var deviceCount int64
+		var todayCount int64
+		today := time.Now().Format("2006-01-02")
+		if err := a.db.Model(&platform.ImageRecord{}).Count(&imageCount).Error; err != nil {
+			return nil, err
+		}
+		if err := a.db.Model(&platform.Device{}).Count(&deviceCount).Error; err != nil {
+			return nil, err
+		}
+		if err := a.db.Model(&platform.ImageRecord{}).Where("created_at >= ?", today).Count(&todayCount).Error; err != nil {
+			return nil, err
+		}
 
-	type tagCount struct {
-		Tag   string `json:"tag"`
-		Count int64  `json:"count"`
+		type tagCount struct {
+			Tag   string `json:"tag"`
+			Count int64  `json:"count"`
+		}
+		var tags []tagCount
+		if err := a.db.Model(&platform.ImageTag{}).Select("tag, count(*) as count").Group("tag").Order("count desc").Limit(10).Scan(&tags).Error; err != nil {
+			return nil, err
+		}
+		return gin.H{"images": imageCount, "devices": deviceCount, "today": todayCount, "tags": tags}, nil
+	})
+}
+
+func (a *app) cachedJSON(c *gin.Context, key string, ttl time.Duration, producer func(context.Context) (gin.H, error)) {
+	ctx := c.Request.Context()
+	if a.redis != nil {
+		raw, err := a.redis.Get(ctx, key).Bytes()
+		if err == nil {
+			c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
+			return
+		}
+		if !errors.Is(err, redis.Nil) {
+			log.Printf("redis cache get failed key=%s err=%v", key, err)
+		}
 	}
-	var tags []tagCount
-	_ = a.db.Model(&platform.ImageTag{}).Select("tag, count(*) as count").Group("tag").Order("count desc").Limit(10).Scan(&tags).Error
-	c.JSON(http.StatusOK, gin.H{"images": imageCount, "devices": deviceCount, "today": todayCount, "tags": tags})
+
+	payload, err := producer(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if a.redis != nil {
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("json marshal cache payload failed key=%s err=%v", key, err)
+		} else if err := a.redis.Set(ctx, key, raw, ttl).Err(); err != nil {
+			log.Printf("redis cache set failed key=%s err=%v", key, err)
+		}
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+func (a *app) invalidateDashboardCache(ctx context.Context) {
+	if a.redis == nil {
+		return
+	}
+	if err := a.redis.Del(ctx, cacheKeyStats, cacheKeyTasksStatus, cacheKeyDevices).Err(); err != nil {
+		log.Printf("redis cache invalidate failed: %v", err)
+	}
 }
 
 func (a *app) enqueueImage(ctx context.Context, record platform.ImageRecord) error {

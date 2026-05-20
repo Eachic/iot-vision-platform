@@ -1,6 +1,6 @@
 # 基于云边端协同的物联网视觉数据平台
 
-这是一个用于《物联网技术与应用》课程报告的 MVP 项目，覆盖端侧采集、边缘去重、云端存储、Redis Stream 流处理、Worker 异步图片处理、MySQL 元数据管理和 Vue 可视化展示。
+这是一个用于《物联网技术与应用》课程报告的 MVP 项目，覆盖端侧采集、边缘去重、云端存储、Redis Stream 流处理、Redis 短 TTL 查询缓存、Worker 异步图片处理、MySQL 元数据管理和 Vue 可视化展示。
 
 ## 目录结构
 
@@ -28,7 +28,8 @@ iot-vision-platform/
 ```text
 device-simulator / pressure-test
   -> edge-node :8081 /api/edge/upload
-  -> cloud-api :8080 /api/images/upload
+  -> nginx gateway(frontend :5173) /api/images/upload
+  -> cloud-api :8080
   -> Storage(LOCAL 或 HUAWEI OBS)
   -> MySQL images/devices
   -> Redis Stream image_uploaded_stream
@@ -58,26 +59,47 @@ device-simulator / pressure-test
 
 ```text
 browser(Vue :5173)
-  -> cloud-api :8080 /api/auth/login
+  -> nginx gateway(frontend :5173) /api/auth/login
   -> browser localStorage 保存 JWT
-  -> cloud-api :8080 /api/images /api/devices /api/tasks/status /api/stats
-  -> MySQL 查询元数据
+  -> nginx gateway(frontend :5173) /api/images /api/devices /api/tasks/status /api/stats
+  -> cloud-api :8080
+  -> Redis 查询缓存(/devices /tasks/status /stats)
+  -> MySQL 查询元数据(缓存未命中时)
   -> cloud-api 生成 original_url/thumbnail_url
   -> browser <img> 直接请求本地静态文件或 OBS URL
 ```
 
 1. 用户打开 Vue 前端并登录，前端调用 `POST /api/auth/login`。登录成功后，JWT token 保存在浏览器 `localStorage`。
 2. 前端后续请求会自动携带 `Authorization: Bearer <token>`，访问 `/api/images`、`/api/devices`、`/api/tasks/status`、`/api/stats`。
-3. `cloud-api` 校验 JWT 后从 MySQL 读取图片、设备、任务和统计元数据，并把图片记录转换为前端需要的响应结构。
+3. `cloud-api` 校验 JWT 后读取图片、设备、任务和统计元数据，并把图片记录转换为前端需要的响应结构。其中 `/api/devices`、`/api/tasks/status`、`/api/stats` 会先读 Redis 短 TTL 缓存，未命中时再回源 MySQL。
 4. 对每张图片，`cloud-api` 会返回：
    - `original_url`：原图访问地址。
    - `thumbnail_url`：缩略图访问地址。
-5. `STORAGE_PROVIDER=LOCAL` 时，URL 形如 `/files/original/...` 或 `/files/thumbnail/...`，前端会拼接到 `http://127.0.0.1:8080`，由 `cloud-api` 的静态文件路由返回图片。
+5. `STORAGE_PROVIDER=LOCAL` 时，URL 形如 `/files/original/...` 或 `/files/thumbnail/...`，前端通过同源 nginx 网关访问，由 nginx 转发到 `cloud-api` 的静态文件路由返回图片。
 6. `STORAGE_PROVIDER=HUAWEI` 时，URL 指向 OBS：
    - 如果配置了 `HUAWEI_OBS_PUBLIC_URL`，后端优先返回公开访问 URL。
    - 如果没有配置公开 URL，后端会生成临时签名 URL，适合私有桶。
 7. 前端用 `<img>` 直接加载 `thumbnail_url` 显示图库缩略图；用户点击图片后，弹窗使用 `original_url` 加载原图，并展示设备、标签、尺寸、大小、格式和采集时间。
 8. 前端每 5 秒刷新一次数据，因此图片状态会从 `queued`、`processing` 自动变为 `completed`，缩略图和标签也会在 worker 处理完成后出现在页面上。
+
+### Redis 缓存层
+
+Redis 在当前项目里承担两类职责：
+
+- 消息队列：`cloud-api` 上传成功后向 Redis Stream `image_uploaded_stream` 写入图片处理任务，worker 通过 consumer group 并行消费。
+- 查询缓存：`cloud-api` 对高频聚合接口使用短 TTL JSON 缓存，降低前端轮询时对 MySQL 的重复查询压力。
+
+当前缓存范围：
+
+| 接口 | Redis key | TTL |
+| --- | --- | --- |
+| `GET /api/stats` | `cache:cloud-api:stats` | 5 秒 |
+| `GET /api/tasks/status` | `cache:cloud-api:tasks_status` | 2 秒 |
+| `GET /api/devices` | `cache:cloud-api:devices` | 10 秒 |
+
+暂时不缓存 `GET /api/images`，因为图片列表存在分页、筛选、排序和对象存储签名 URL，缓存失效和 URL 过期处理更复杂。
+
+缓存一致性采用“短 TTL + 上传后主动失效”的方式：`cloud-api` 每次成功接收新图片后会删除以上三个缓存 key，让新增图片和设备尽快体现在前端；worker 更新任务状态和标签时不主动操作 cloud-api 缓存，依赖 `/api/tasks/status` 的 2 秒 TTL 快速收敛。Redis 不可用时，接口会自动回退到 MySQL 查询，核心上传和展示链路仍可运行。
 
 ## 环境要求
 
@@ -144,9 +166,9 @@ pip install -r pressure-test/requirements.txt
 三个默认档位：
 
 ```powershell
-python pressure-test/pressure_upload.py --low
-python pressure-test/pressure_upload.py --mid
-python pressure-test/pressure_upload.py --high
+python pressure-test/pressure_upload.py --low --route edge
+python pressure-test/pressure_upload.py --mid --route edge
+python pressure-test/pressure_upload.py --high --route edge
 ```
 
 也可以用批处理脚本：
@@ -176,8 +198,10 @@ python pressure-test/pressure_upload.py --mid --workers 80 --duration 90 --image
 如果要直压 cloud-api 而不是完整边缘链路：
 
 ```powershell
-python pressure-test/pressure_upload.py --low --target http://127.0.0.1:8080/api/images/upload
+python pressure-test/pressure_upload.py --low --route gateway
 ```
+
+`--route edge` 会走完整链路 `设备 -> edge-node -> nginx -> cloud-api`；`--route gateway` 会绕过 edge-node，直接通过 nginx 网关上传到 `cloud-api`，适合单独压测 cloud-api 横向扩展能力。也可以用 `--target` 手动覆盖上传 URL。
 
 默认 Dockerfile 使用 `docker.m.daocloud.io/library` 作为基础镜像源，避免直接访问 Docker Hub 超时。如果你的网络可以直连 Docker Hub，也可以把 `docker-compose.yml` 中的 `IMAGE_REGISTRY` 改成 `docker.io/library`。
 
@@ -203,9 +227,22 @@ docker compose ps
 查看日志：
 
 ```powershell
+docker compose logs -f frontend
 docker compose logs -f cloud-api
 docker compose logs -f worker
 docker compose logs -f edge-node
+```
+
+横向扩展 `cloud-api`：
+
+```powershell
+docker compose up -d --scale cloud-api=3 cloud-api frontend
+```
+
+如果扩容后 nginx 没有立刻识别新的 `cloud-api` 副本，可以重启 frontend 容器刷新 Docker DNS 解析结果：
+
+```powershell
+docker compose restart frontend
 ```
 
 启动一个容器内设备模拟器：
@@ -229,12 +266,14 @@ docker compose down -v
 Docker 版本默认端口：
 
 ```text
-frontend:  http://127.0.0.1:5173
-cloud-api: http://127.0.0.1:8080
-edge-node: http://127.0.0.1:8081
-mysql:     127.0.0.1:3307
-redis:     127.0.0.1:6379
+frontend/nginx gateway: http://127.0.0.1:5173
+API health:             http://127.0.0.1:5173/api/health
+edge-node:              http://127.0.0.1:8081
+mysql:                  127.0.0.1:3307
+redis:                  127.0.0.1:6379
 ```
+
+Docker 模式下 `cloud-api` 不再默认暴露宿主机 `8080`，只在 Compose 内部网络中监听 `8080`，由 frontend 容器内的 nginx 统一代理 `/api/*` 和 `/files/*`。
 
 Docker 版本还包含一个 Python `ai-service`，Worker 会通过 gRPC 调用它进行标签分析。`STORAGE_PROVIDER=LOCAL` 时它可继续通过只读共享 volume 读取 `/app/storage/original/...` 图片路径；`STORAGE_PROVIDER=HUAWEI` 时 Worker 会传入华为 OBS 的可访问 URL，`ai-service` 不再依赖本地原图文件。
 
@@ -660,7 +699,7 @@ HUAWEI_OBS_PUBLIC_URL=https://你的bucket.obs.cn-north-4.myhuaweicloud.com
 ```powershell
 $env:STORAGE_PROVIDER="HUAWEI"
 $env:STORAGE_OBJECT_PREFIX="original"
-docker compose up --build -d cloud-api
+docker compose up --build -d cloud-api worker frontend
 ```
 
 上传成功后，MySQL `images` 表会保存当前存储中的 `original_path`。在 OBS 模式下，它是对象 key，同时还会写入：

@@ -19,6 +19,8 @@ echo   "dedup_enabled": false
 echo.
 echo Frontend:
 echo   http://127.0.0.1:5173
+echo API Gateway health:
+echo   http://127.0.0.1:5173/api/health
 echo.
 echo To generate more upload traffic:
 echo   docker compose --profile simulator up --build -d --scale simulator=3 simulator
