@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"log"
@@ -14,8 +15,17 @@ import (
 	"iot-vision-platform/internal/platform"
 
 	"github.com/go-redis/redis/v8"
+	mysqlDriver "github.com/go-sql-driver/mysql"
 	"gorm.io/gorm"
 )
+
+const (
+	dbRetryAttempts = 8
+	dbRetryDelay    = 150 * time.Millisecond
+	pendingMinIdle  = 5 * time.Minute
+)
+
+var errRetryMessageLater = errors.New("retry stream message later")
 
 type worker struct {
 	db       *gorm.DB
@@ -82,28 +92,80 @@ func main() {
 }
 
 func (w *worker) consume(ctx context.Context) error {
-	streams, err := w.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    "image_workers",
-		Consumer: w.name,
-		Streams:  []string{"image_uploaded_stream", ">"},
-		Count:    1,
-		Block:    5 * time.Second,
-	}).Result()
+	if handled, err := w.consumePending(ctx); err != nil || handled {
+		return err
+	}
+	streams, err := w.readGroup(ctx, ">")
 	if errors.Is(err, redis.Nil) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	for _, stream := range streams {
-		for _, msg := range stream.Messages {
-			if err := w.process(ctx, msg); err != nil {
-				log.Printf("process failed message=%s err=%v", msg.ID, err)
-			}
-			_ = w.redis.XAck(ctx, "image_uploaded_stream", "image_workers", msg.ID).Err()
-		}
-	}
+	w.handleStreams(ctx, streams)
 	return nil
+}
+
+func (w *worker) consumePending(ctx context.Context) (bool, error) {
+	pending, err := w.redis.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: "image_uploaded_stream",
+		Group:  "image_workers",
+		Start:  "-",
+		End:    "+",
+		Count:  1,
+	}).Result()
+	if errors.Is(err, redis.Nil) || len(pending) == 0 {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	for _, item := range pending {
+		if item.Idle < pendingMinIdle {
+			continue
+		}
+		messages, err := w.redis.XClaim(ctx, &redis.XClaimArgs{
+			Stream:   "image_uploaded_stream",
+			Group:    "image_workers",
+			Consumer: w.name,
+			MinIdle:  pendingMinIdle,
+			Messages: []string{item.ID},
+		}).Result()
+		if err != nil {
+			return false, err
+		}
+		w.handleMessages(ctx, messages)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (w *worker) readGroup(ctx context.Context, start string) ([]redis.XStream, error) {
+	return w.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    "image_workers",
+		Consumer: w.name,
+		Streams:  []string{"image_uploaded_stream", start},
+		Count:    1,
+		Block:    5 * time.Second,
+	}).Result()
+}
+
+func (w *worker) handleStreams(ctx context.Context, streams []redis.XStream) {
+	for _, stream := range streams {
+		w.handleMessages(ctx, stream.Messages)
+	}
+}
+
+func (w *worker) handleMessages(ctx context.Context, messages []redis.XMessage) {
+	for _, msg := range messages {
+		if err := w.process(ctx, msg); err != nil {
+			log.Printf("process failed message=%s err=%v", msg.ID, err)
+			if errors.Is(err, errRetryMessageLater) {
+				continue
+			}
+		}
+		_ = w.redis.XAck(ctx, "image_uploaded_stream", "image_workers", msg.ID).Err()
+	}
 }
 
 func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
@@ -116,49 +178,46 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 	if imageID == "" || originalPath == "" {
 		return nil
 	}
-	if err := w.db.Model(&platform.ImageRecord{}).Where("image_id = ?", imageID).Updates(map[string]interface{}{
-		"status":        platform.StatusProcessing,
-		"error_message": "",
-	}).Error; err != nil {
-		return err
+	if err := retryDB(func() error {
+		return w.db.Model(&platform.ImageRecord{}).Where("image_id = ?", imageID).Updates(map[string]interface{}{
+			"status":        platform.StatusProcessing,
+			"error_message": "",
+		}).Error
+	}); err != nil {
+		return retryMessageLater(err)
 	}
 
 	var record platform.ImageRecord
-	if err := w.db.Where("image_id = ?", imageID).First(&record).Error; err != nil {
-		w.markFailed(imageID, err)
-		return err
+	if err := retryDB(func() error {
+		return w.db.Where("image_id = ?", imageID).First(&record).Error
+	}); err != nil {
+		return w.failImage(imageID, err)
 	}
 	originalKey := w.storageKey(record.OriginalPath, record.OriginalObjectKey)
 	reader, _, err := w.storage.Get(ctx, originalKey)
 	if err != nil {
-		w.markFailed(imageID, err)
-		return err
+		return w.failImage(imageID, err)
 	}
 	originalBytes, err := io.ReadAll(reader)
 	closeErr := reader.Close()
 	if err != nil {
-		w.markFailed(imageID, err)
-		return err
+		return w.failImage(imageID, err)
 	}
 	if closeErr != nil {
-		w.markFailed(imageID, closeErr)
-		return closeErr
+		return w.failImage(imageID, closeErr)
 	}
 	hash, size, err := platform.HashReaderHex(bytes.NewReader(originalBytes))
 	if err != nil {
-		w.markFailed(imageID, err)
-		return err
+		return w.failImage(imageID, err)
 	}
 	img, format, err := platform.DecodeImageReader(bytes.NewReader(originalBytes))
 	if err != nil {
-		w.markFailed(imageID, err)
-		return err
+		return w.failImage(imageID, err)
 	}
 	bounds := img.Bounds()
 	thumbBytes, err := platform.CreateThumbnailJPEG(img, 360)
 	if err != nil {
-		w.markFailed(imageID, err)
-		return err
+		return w.failImage(imageID, err)
 	}
 	thumbKey := filepath.ToSlash(filepath.Join("thumbnail", imageID+".jpg"))
 	if _, err := w.storage.Put(ctx, thumbKey, bytes.NewReader(thumbBytes), platform.PutObjectOptions{
@@ -168,11 +227,19 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 			"image-id": imageID,
 		},
 	}); err != nil {
-		w.markFailed(imageID, err)
-		return err
+		return w.failImage(imageID, err)
 	}
 	tags := w.analyzeTags(ctx, imageID, originalKey, originalName, format, img)
-	err = w.db.Transaction(func(tx *gorm.DB) error {
+	if err := retryDB(func() error {
+		return w.completeImage(imageID, thumbKey, hash, bounds.Dx(), bounds.Dy(), size, format, tags)
+	}); err != nil {
+		return w.failImage(imageID, err)
+	}
+	return nil
+}
+
+func (w *worker) completeImage(imageID string, thumbKey string, hash string, width int, height int, size int64, format string, tags []platform.GeneratedTag) error {
+	return w.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("image_id = ?", imageID).Delete(&platform.ImageTag{}).Error; err != nil {
 			return err
 		}
@@ -188,15 +255,14 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 		return tx.Model(&platform.ImageRecord{}).Where("image_id = ?", imageID).Updates(map[string]interface{}{
 			"thumbnail_path": thumbKey,
 			"hash":           hash,
-			"width":          bounds.Dx(),
-			"height":         bounds.Dy(),
+			"width":          width,
+			"height":         height,
 			"size":           size,
 			"format":         format,
 			"status":         platform.StatusCompleted,
 			"error_message":  "",
 		}).Error
 	})
-	return err
 }
 
 func (w *worker) analyzeTags(ctx context.Context, imageID string, originalKey string, originalName string, format string, img image.Image) []platform.GeneratedTag {
@@ -246,11 +312,20 @@ func (w *worker) pollDatabase() error {
 	return w.process(context.Background(), msg)
 }
 
-func (w *worker) markFailed(imageID string, err error) {
-	_ = w.db.Model(&platform.ImageRecord{}).Where("image_id = ?", imageID).Updates(map[string]interface{}{
-		"status":        platform.StatusFailed,
-		"error_message": err.Error(),
-	}).Error
+func (w *worker) failImage(imageID string, cause error) error {
+	if err := w.markFailed(imageID, cause); err != nil {
+		return retryMessageLater(err)
+	}
+	return cause
+}
+
+func (w *worker) markFailed(imageID string, cause error) error {
+	return retryDB(func() error {
+		return w.db.Model(&platform.ImageRecord{}).Where("image_id = ?", imageID).Updates(map[string]interface{}{
+			"status":        platform.StatusFailed,
+			"error_message": cause.Error(),
+		}).Error
+	})
 }
 
 func (w *worker) storageKey(pathOrKey string, objectKey string) string {
@@ -294,4 +369,35 @@ func value(msg redis.XMessage, key string) string {
 
 func isBusyGroup(err error) bool {
 	return err != nil && (err.Error() == "BUSYGROUP Consumer Group name already exists" || len(err.Error()) >= 9 && err.Error()[:9] == "BUSYGROUP")
+}
+
+func retryMessageLater(err error) error {
+	return fmt.Errorf("%w: %v", errRetryMessageLater, err)
+}
+
+func retryDB(fn func() error) error {
+	var err error
+	for attempt := 1; attempt <= dbRetryAttempts; attempt++ {
+		err = fn()
+		if err == nil || !isRetryableDBError(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt) * dbRetryDelay)
+	}
+	return err
+}
+
+func isRetryableDBError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *mysqlDriver.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == 1213 || mysqlErr.Number == 1205
+	}
+	message := err.Error()
+	return strings.Contains(message, "Error 1213") ||
+		strings.Contains(message, "Deadlock found") ||
+		strings.Contains(message, "Error 1205") ||
+		strings.Contains(message, "Lock wait timeout")
 }

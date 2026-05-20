@@ -97,7 +97,9 @@ const completedRatio = computed(() => {
   const counts = taskStatus.value.counts || {}
   const total = Object.values(counts).reduce((sum, value) => sum + Number(value || 0), 0)
   if (!total) return 0
-  return Math.round((Number(counts.completed || 0) / total) * 100)
+  const active = Number(counts.queued || 0) + Number(counts.processing || 0)
+  const ratio = Math.floor((Number(counts.completed || 0) / total) * 100)
+  return active > 0 ? Math.min(99, ratio) : ratio
 })
 
 async function refresh() {

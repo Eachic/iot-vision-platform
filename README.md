@@ -101,6 +101,10 @@ Redis 在当前项目里承担两类职责：
 
 缓存一致性采用“短 TTL + 上传后主动失效”的方式：`cloud-api` 每次成功接收新图片后会删除以上三个缓存 key，让新增图片和设备尽快体现在前端；worker 更新任务状态和标签时不主动操作 cloud-api 缓存，依赖 `/api/tasks/status` 的 2 秒 TTL 快速收敛。Redis 不可用时，接口会自动回退到 MySQL 查询，核心上传和展示链路仍可运行。
 
+`/api/tasks/status` 还会顺带清理异常中断留下的孤儿任务：如果某张图片保持 `processing` 超过 10 分钟，说明 worker 很可能在处理过程中被停止或重启，`cloud-api` 会把这类记录标记为 `failed` 并写入超时错误信息，避免前端任务状态长期卡在“处理中”。
+
+多个 worker 高并发写入 MySQL 时，`image_tags` 删除、插入和 `images` 状态更新可能遇到 MySQL 死锁 `Error 1213 (40001)` 或锁等待超时。worker 会对这类可重试数据库错误自动重试事务；如果数据库暂时不可写，Redis Stream 消息不会被 ACK，会留在 pending 列表中，空闲 5 分钟后由 worker 重新认领。这个时间要明显长于正常图片处理耗时，避免一张正在处理的图片被其他 worker 过早重复认领。
+
 ## 环境要求
 
 Docker 部署只需要：

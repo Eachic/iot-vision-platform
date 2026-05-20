@@ -37,6 +37,8 @@ const (
 	statsCacheTTL       = 5 * time.Second
 	tasksStatusCacheTTL = 2 * time.Second
 	devicesCacheTTL     = 10 * time.Second
+
+	staleProcessingTimeout = 10 * time.Minute
 )
 
 type app struct {
@@ -469,6 +471,9 @@ func (a *app) listDevices(c *gin.Context) {
 
 func (a *app) taskStatus(c *gin.Context) {
 	a.cachedJSON(c, cacheKeyTasksStatus, tasksStatusCacheTTL, func(ctx context.Context) (gin.H, error) {
+		if err := a.reconcileStaleProcessingTasks(ctx); err != nil {
+			log.Printf("reconcile stale processing tasks failed: %v", err)
+		}
 		counts := map[string]int64{}
 		for _, status := range []string{platform.StatusQueued, platform.StatusProcessing, platform.StatusCompleted, platform.StatusFailed} {
 			var count int64
@@ -483,6 +488,23 @@ func (a *app) taskStatus(c *gin.Context) {
 		}
 		return gin.H{"counts": counts, "recent": a.mapImages(ctx, recent)}, nil
 	})
+}
+
+func (a *app) reconcileStaleProcessingTasks(ctx context.Context) error {
+	deadline := time.Now().Add(-staleProcessingTimeout)
+	result := a.db.WithContext(ctx).Model(&platform.ImageRecord{}).
+		Where("status = ? AND updated_at < ?", platform.StatusProcessing, deadline).
+		Updates(map[string]interface{}{
+			"status":        platform.StatusFailed,
+			"error_message": "processing timeout, worker may have stopped before finishing",
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected > 0 {
+		log.Printf("marked stale processing tasks as failed count=%d", result.RowsAffected)
+	}
+	return nil
 }
 
 func (a *app) stats(c *gin.Context) {
