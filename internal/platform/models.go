@@ -23,7 +23,7 @@ type Device struct {
 type ImageRecord struct {
 	ID                      uint64     `gorm:"primaryKey" json:"id"`
 	ImageID                 string     `gorm:"size:64;uniqueIndex;not null" json:"image_id"`
-	DeviceID                string     `gorm:"size:64;not null;index" json:"device_id"`
+	DeviceID                string     `gorm:"size:64;not null;index;index:idx_images_device_created_at,priority:1" json:"device_id"`
 	EdgeNodeID              string     `gorm:"size:64;not null" json:"edge_node_id"`
 	OriginalPath            string     `gorm:"size:512;not null" json:"original_path"`
 	ThumbnailPath           string     `gorm:"size:512;not null" json:"thumbnail_path"`
@@ -37,10 +37,10 @@ type ImageRecord struct {
 	Height                  int        `gorm:"not null;default:0" json:"height"`
 	Size                    int64      `gorm:"not null;default:0" json:"size"`
 	Format                  string     `gorm:"size:32;not null" json:"format"`
-	Status                  string     `gorm:"size:32;not null;index" json:"status"`
+	Status                  string     `gorm:"size:32;not null;index;index:idx_images_status_created_at,priority:1" json:"status"`
 	ErrorMessage            string     `gorm:"type:text" json:"error_message"`
 	CapturedAt              *time.Time `gorm:"index" json:"captured_at"`
-	CreatedAt               time.Time  `json:"created_at"`
+	CreatedAt               time.Time  `gorm:"index;index:idx_images_status_created_at,priority:2;index:idx_images_device_created_at,priority:2" json:"created_at"`
 	UpdatedAt               time.Time  `json:"updated_at"`
 	Tags                    []ImageTag `gorm:"foreignKey:ImageID;references:ImageID" json:"tags"`
 }

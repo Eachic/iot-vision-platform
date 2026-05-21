@@ -96,10 +96,11 @@ Redis 在当前项目里承担两类职责：
 | `GET /api/stats` | `cache:cloud-api:stats` | 5 秒 |
 | `GET /api/tasks/status` | `cache:cloud-api:tasks_status` | 2 秒 |
 | `GET /api/devices` | `cache:cloud-api:devices` | 10 秒 |
+| 默认第一页 `GET /api/images` | `cache:cloud-api:images:first_page` | 2 秒 |
 
-暂时不缓存 `GET /api/images`，因为图片列表存在分页、筛选、排序和对象存储签名 URL，缓存失效和 URL 过期处理更复杂。
+`GET /api/images` 只缓存前端默认第一页：无筛选条件、`page=1`、`page_size=60`、`sort_by=created_at`、`sort_order=desc`。带设备、状态、标签、时间范围筛选，或翻页、改排序时仍直接查询 MySQL，避免缓存 key 爆炸和复杂失效问题。
 
-缓存一致性采用“短 TTL + 上传后主动失效”的方式：`cloud-api` 每次成功接收新图片后会删除以上三个缓存 key，让新增图片和设备尽快体现在前端；worker 更新任务状态和标签时不主动操作 cloud-api 缓存，依赖 `/api/tasks/status` 的 2 秒 TTL 快速收敛。Redis 不可用时，接口会自动回退到 MySQL 查询，核心上传和展示链路仍可运行。
+缓存一致性采用“短 TTL + 上传后主动失效”的方式：`cloud-api` 每次成功接收新图片后会删除以上缓存 key，让新增图片和设备尽快体现在前端；worker 更新任务状态和标签时不主动操作 cloud-api 缓存，依赖 `/api/tasks/status` 与默认图片列表的短 TTL 快速收敛。Redis 不可用时，接口会自动回退到 MySQL 查询，核心上传和展示链路仍可运行。
 
 `/api/tasks/status` 还会顺带清理异常中断留下的孤儿任务：如果某张图片保持 `processing` 超过 10 分钟，说明 worker 很可能在处理过程中被停止或重启，`cloud-api` 会把这类记录标记为 `failed` 并写入超时错误信息，避免前端任务状态长期卡在“处理中”。
 
@@ -206,6 +207,52 @@ python pressure-test/pressure_upload.py --low --route gateway
 ```
 
 `--route edge` 会走完整链路 `设备 -> edge-node -> nginx -> cloud-api`；`--route gateway` 会绕过 edge-node，直接通过 nginx 网关上传到 `cloud-api`，适合单独压测 cloud-api 横向扩展能力。也可以用 `--target` 手动覆盖上传 URL。
+
+## 查询接口压测
+
+如果要压测前端总览和图库相关查询效率，可以先自行安装 `hey`，然后运行：
+
+```powershell
+.\run-query-pressure.cmd
+```
+
+脚本会自动登录 `http://127.0.0.1:5173/api/auth/login` 获取 JWT，并依次压测四个接口：
+
+```text
+GET /api/stats
+GET /api/tasks/status
+GET /api/devices
+GET /api/images?page=1&page_size=60&sort_by=created_at&sort_order=desc
+```
+
+四个接口都会命中当前缓存路径，其中 `/api/images` 只缓存默认第一页。默认参数是并发 50、持续 60 秒，并会先请求一次四个接口用于热缓存。如果想观察 MySQL 原始查询压力，可以加 `-NoWarmup` 或压测带筛选、翻页、改排序的 `/api/images` 请求。
+
+自定义参数示例：
+
+```powershell
+.\run-query-pressure.cmd -Concurrency 100 -Duration 120s
+.\run-query-pressure.cmd -BaseUrl http://127.0.0.1:5173 -Username admin -Password admin123456
+.\run-query-pressure.cmd -NoWarmup
+```
+
+压测报告里重点看 `Requests/sec`、平均延迟、`95%`、`99%` 和非 2xx 响应数量。通常缓存接口的 QPS 应明显高于 `/api/images`。
+
+一次本地查询压测记录，记录于默认图片列表缓存加入之前：
+
+```text
+时间：2026-05-21
+入口：http://127.0.0.1:5173
+工具：hey
+参数：并发 50，每个接口持续 60 秒
+结果：四个接口均为 200 响应，无非 2xx 错误
+
+/api/stats          QPS 3688.6，平均 13.6ms，P95 37.5ms，P99 56.5ms
+/api/tasks/status   QPS 3165.3，平均 15.8ms，P95 38.5ms，P99 65.1ms
+/api/devices        QPS 3526.6，平均 14.2ms，P95 35.7ms，P99 51.2ms
+/api/images         QPS 255.8， 平均 195.3ms，P95 355.5ms，P99 435.4ms
+```
+
+结论：`/api/stats`、`/api/tasks/status`、`/api/devices` 三个 Redis 缓存接口 QPS 均超过 3000，延迟较低；当时未缓存的 `/api/images` 主要依赖 MySQL 分页、排序、标签预加载和图片 URL 拼接，是查询链路瓶颈。后续已对默认第一页 `/api/images` 增加 2 秒 Redis 缓存，并为 `images.created_at`、`status + created_at`、`device_id + created_at` 增加索引。
 
 默认 Dockerfile 使用 `docker.m.daocloud.io/library` 作为基础镜像源，避免直接访问 Docker Hub 超时。如果你的网络可以直连 Docker Hub，也可以把 `docker-compose.yml` 中的 `IMAGE_REGISTRY` 改成 `docker.io/library`。
 

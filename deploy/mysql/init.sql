@@ -48,7 +48,10 @@ CREATE TABLE IF NOT EXISTS images (
   INDEX idx_images_device_id (device_id),
   INDEX idx_images_status (status),
   INDEX idx_images_hash (hash),
-  INDEX idx_images_captured_at (captured_at)
+  INDEX idx_images_captured_at (captured_at),
+  INDEX idx_images_created_at (created_at),
+  INDEX idx_images_status_created_at (status, created_at),
+  INDEX idx_images_device_created_at (device_id, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS image_tags (

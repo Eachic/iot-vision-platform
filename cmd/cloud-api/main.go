@@ -33,10 +33,12 @@ const (
 	cacheKeyStats       = "cache:cloud-api:stats"
 	cacheKeyTasksStatus = "cache:cloud-api:tasks_status"
 	cacheKeyDevices     = "cache:cloud-api:devices"
+	cacheKeyImagesFirst = "cache:cloud-api:images:first_page"
 
 	statsCacheTTL       = 5 * time.Second
 	tasksStatusCacheTTL = 2 * time.Second
 	devicesCacheTTL     = 10 * time.Second
+	imagesFirstCacheTTL = 2 * time.Second
 
 	staleProcessingTimeout = 10 * time.Minute
 )
@@ -388,25 +390,30 @@ func (a *app) uploadImage(c *gin.Context) {
 }
 
 func (a *app) listImages(c *gin.Context) {
-	var images []platform.ImageRecord
+	hasFilter := false
 	query := a.db.Preload("Tags")
-	if v := c.Query("device_id"); v != "" {
+	if v := strings.TrimSpace(c.Query("device_id")); v != "" {
+		hasFilter = true
 		query = query.Where("device_id = ?", v)
 	}
-	if v := c.Query("status"); v != "" {
+	if v := strings.TrimSpace(c.Query("status")); v != "" {
+		hasFilter = true
 		query = query.Where("status = ?", v)
 	}
-	if v := c.Query("start_time"); v != "" {
+	if v := strings.TrimSpace(c.Query("start_time")); v != "" {
+		hasFilter = true
 		if t := parseTime(v); t != nil {
 			query = query.Where("created_at >= ?", *t)
 		}
 	}
-	if v := c.Query("end_time"); v != "" {
+	if v := strings.TrimSpace(c.Query("end_time")); v != "" {
+		hasFilter = true
 		if t := parseTime(v); t != nil {
 			query = query.Where("created_at <= ?", *t)
 		}
 	}
-	if v := c.Query("tag"); v != "" {
+	if v := strings.TrimSpace(c.Query("tag")); v != "" {
+		hasFilter = true
 		query = query.Joins("JOIN image_tags ON image_tags.image_id = images.image_id").Where("image_tags.tag = ?", v)
 	}
 
@@ -414,16 +421,34 @@ func (a *app) listImages(c *gin.Context) {
 	pageSize := min(200, max(1, parseInt(c.Query("page_size"), 20)))
 	sortBy := imageSortColumn(c.Query("sort_by"))
 	sortOrder := imageSortOrder(c.Query("sort_order"))
+	if isDefaultImagesQuery(hasFilter, page, pageSize, sortBy, sortOrder) {
+		a.cachedJSON(c, cacheKeyImagesFirst, imagesFirstCacheTTL, func(ctx context.Context) (gin.H, error) {
+			return a.queryImages(ctx, query, page, pageSize, sortBy, sortOrder)
+		})
+		return
+	}
+	payload, err := a.queryImages(c.Request.Context(), query, page, pageSize, sortBy, sortOrder)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, payload)
+}
+
+func (a *app) queryImages(ctx context.Context, query *gorm.DB, page int, pageSize int, sortBy string, sortOrder string) (gin.H, error) {
+	var images []platform.ImageRecord
 	var total int64
 	if err := query.Model(&platform.ImageRecord{}).Count(&total).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return nil, err
 	}
 	if err := query.Order(sortBy + " " + sortOrder).Offset((page - 1) * pageSize).Limit(pageSize).Find(&images).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
+		return nil, err
 	}
-	c.JSON(http.StatusOK, gin.H{"items": a.mapImages(c.Request.Context(), images), "total": total, "page": page, "page_size": pageSize, "sort_by": sortBy, "sort_order": sortOrder})
+	return gin.H{"items": a.mapImages(ctx, images), "total": total, "page": page, "page_size": pageSize, "sort_by": sortBy, "sort_order": sortOrder}, nil
+}
+
+func isDefaultImagesQuery(hasFilter bool, page int, pageSize int, sortBy string, sortOrder string) bool {
+	return !hasFilter && page == 1 && pageSize == 60 && sortBy == "created_at" && sortOrder == "desc"
 }
 
 func (a *app) getImage(c *gin.Context) {
@@ -568,7 +593,7 @@ func (a *app) invalidateDashboardCache(ctx context.Context) {
 	if a.redis == nil {
 		return
 	}
-	if err := a.redis.Del(ctx, cacheKeyStats, cacheKeyTasksStatus, cacheKeyDevices).Err(); err != nil {
+	if err := a.redis.Del(ctx, cacheKeyStats, cacheKeyTasksStatus, cacheKeyDevices, cacheKeyImagesFirst).Err(); err != nil {
 		log.Printf("redis cache invalidate failed: %v", err)
 	}
 }
