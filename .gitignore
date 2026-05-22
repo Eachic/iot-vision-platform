@@ -12,9 +12,13 @@ pressure-test/generated-images-*/
 pressure-test/generated-test-images/
 **/__pycache__/
 ai-service/__pycache__/
+ai-detection-service/test-output/
 *.pyc
 *.log
 
 tools/
 
 *.pdf
+*.exe
+VOC2028/*
+*.zip

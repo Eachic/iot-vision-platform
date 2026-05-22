@@ -7,6 +7,15 @@ storage
 frontend/node_modules
 frontend/dist
 device-simulator/sample-images
+sample-images
+VOC2028
+VOC2028.zip
+*.zip
+*.exe
+ai-detection-service/test-output
+pressure-test/generated-images
+pressure-test/generated-images-*
+pressure-test/generated-test-images
 **/__pycache__
 *.pyc
 .env

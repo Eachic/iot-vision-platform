@@ -27,6 +27,20 @@ type AnalyzeImageRequest struct {
 	Params      map[string]string
 }
 
+type Detection struct {
+	Label      string
+	Confidence float64
+	Box        BoundingBox
+}
+
+type BoundingBox struct {
+	X              float64
+	Y              float64
+	Width          float64
+	Height         float64
+	CoordinateType string
+}
+
 type AnalysisTask struct {
 	Type   string
 	Params map[string]string
@@ -73,6 +87,38 @@ func (a *GRPCVisionAnalyzer) Analyze(ctx context.Context, req AnalyzeImageReques
 		return nil, errors.New("ai service returned no classification labels")
 	}
 	return dedupeTags(tags), nil
+}
+
+func (a *GRPCVisionAnalyzer) Detect(ctx context.Context, req AnalyzeImageRequest) ([]Detection, error) {
+	req.Tasks = []AnalysisTask{{Type: "detection"}}
+	resp, err := a.client.AnalyzeImage(ctx, toProtoAnalyzeRequest(req))
+	if err != nil {
+		return nil, err
+	}
+	detections := []Detection{}
+	for _, output := range resp.GetOutputs() {
+		if output.GetType() != "detection" || output.GetDetection() == nil {
+			continue
+		}
+		for _, item := range output.GetDetection().GetDetections() {
+			box := item.GetBox()
+			if box == nil {
+				continue
+			}
+			detections = append(detections, Detection{
+				Label:      item.GetLabel(),
+				Confidence: item.GetConfidence(),
+				Box: BoundingBox{
+					X:              box.GetX(),
+					Y:              box.GetY(),
+					Width:          box.GetWidth(),
+					Height:         box.GetHeight(),
+					CoordinateType: box.GetCoordinateType(),
+				},
+			})
+		}
+	}
+	return detections, nil
 }
 
 func (a *GRPCVisionAnalyzer) Close() error {

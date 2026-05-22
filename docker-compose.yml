@@ -98,9 +98,14 @@ services:
       STORAGE_PROVIDER: ${STORAGE_PROVIDER:-LOCAL}
       STORAGE_OBJECT_PREFIX: ${STORAGE_OBJECT_PREFIX:-original}
       DEVICE_TOKEN: course-demo-token
-      AI_RPC_ENABLED: "true"
+      AI_RPC_ENABLED: "false"
       AI_RPC_ADDR: ai-service:9000
       AI_RPC_TIMEOUT_SECONDS: "5"
+      DETECTION_RPC_ENABLED: ${DETECTION_RPC_ENABLED:-false}
+      DETECTION_RPC_ADDR: ${DETECTION_RPC_ADDR:-host.docker.internal:9100}
+      DETECTION_RPC_TIMEOUT_SECONDS: ${DETECTION_RPC_TIMEOUT_SECONDS:-10}
+      PUBLIC_GATEWAY_URL: ${PUBLIC_GATEWAY_URL:-http://127.0.0.1:5173}
+      DETECTION_IMAGE_BASE_URL: ${DETECTION_IMAGE_BASE_URL:-}
       HUAWEI_OBS_ACCESS_KEY: ${HUAWEI_OBS_ACCESS_KEY:-}
       HUAWEI_OBS_SECRET_KEY: ${HUAWEI_OBS_SECRET_KEY:-}
       HUAWEI_OBS_SECURITY_TOKEN: ${HUAWEI_OBS_SECURITY_TOKEN:-}
@@ -115,8 +120,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      ai-service:
-        condition: service_started
 
   ai-service:
     build:
@@ -196,6 +199,12 @@ services:
     profiles:
       - simulator
     environment:
+      DEVICE_ID: device_docker_001
+      SIMULATOR_ROUTE: edge
+      EDGE_UPLOAD_URL: http://edge-node:8081/api/edge/upload
+      GATEWAY_UPLOAD_URL: http://frontend/api/images/upload
+      UPLOAD_INTERVAL_SECONDS: "3"
+      DEVICE_TOKEN: course-demo-token
       TZ: Asia/Shanghai
     depends_on:
       edge-node:

@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"image"
 	"io"
 	"log"
 	"path/filepath"
@@ -33,7 +32,7 @@ type worker struct {
 	cfg      platform.Config
 	storage  platform.Storage
 	name     string
-	analyzer platform.VisionAnalyzer
+	detector *platform.GRPCVisionAnalyzer
 }
 
 func main() {
@@ -59,14 +58,14 @@ func main() {
 	}
 
 	w := &worker{db: db, redis: rdb, cfg: cfg, storage: storage, name: "worker-" + platform.NewID("node")}
-	if cfg.AIRPCEnabled {
-		analyzer, err := platform.NewGRPCVisionAnalyzer(cfg.AIRPCAddr)
+	if cfg.DetectionRPCEnabled {
+		detector, err := platform.NewGRPCVisionAnalyzer(cfg.DetectionRPCAddr)
 		if err != nil {
-			log.Printf("ai rpc unavailable, worker will use local tag fallback: %v", err)
+			log.Printf("detection rpc unavailable, worker will use plain thumbnails: %v", err)
 		} else {
-			w.analyzer = analyzer
-			defer analyzer.Close()
-			log.Printf("ai rpc enabled: %s", cfg.AIRPCAddr)
+			w.detector = detector
+			defer detector.Close()
+			log.Printf("detection rpc enabled: %s", cfg.DetectionRPCAddr)
 		}
 	}
 	if useRedis {
@@ -215,7 +214,9 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 		return w.failImage(imageID, err)
 	}
 	bounds := img.Bounds()
-	thumbBytes, err := platform.CreateThumbnailJPEG(img, 360)
+	tags := platform.GenerateTags(img, originalName)
+	detections := w.detectObjects(ctx, imageID, originalKey, originalName, format)
+	thumbBytes, err := platform.CreateDetectionThumbnailJPEG(img, 360, detections)
 	if err != nil {
 		return w.failImage(imageID, err)
 	}
@@ -229,13 +230,42 @@ func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
 	}); err != nil {
 		return w.failImage(imageID, err)
 	}
-	tags := w.analyzeTags(ctx, imageID, originalKey, originalName, format, img)
 	if err := retryDB(func() error {
 		return w.completeImage(imageID, thumbKey, hash, bounds.Dx(), bounds.Dy(), size, format, tags)
 	}); err != nil {
 		return w.failImage(imageID, err)
 	}
 	return nil
+}
+
+func (w *worker) detectObjects(ctx context.Context, imageID string, originalKey string, originalName string, format string) []platform.Detection {
+	if w.detector == nil {
+		return nil
+	}
+	detectCtx, cancel := context.WithTimeout(ctx, w.cfg.DetectionRPCTimeout)
+	defer cancel()
+	imageURI := w.detectionImageURI(detectCtx, originalKey)
+	detections, err := w.detector.Detect(detectCtx, platform.AnalyzeImageRequest{
+		RequestID:   platform.NewID("det_req"),
+		ImageID:     imageID,
+		ImageURI:    imageURI,
+		Filename:    originalName,
+		ContentType: "image/" + format,
+		Tasks:       []platform.AnalysisTask{{Type: "detection"}},
+		Params: map[string]string{
+			"storage_provider": string(w.storage.Provider()),
+			"storage_key":      originalKey,
+		},
+	})
+	if err != nil {
+		log.Printf("detection failed image=%s err=%v; using plain thumbnail", imageID, err)
+		return nil
+	}
+	if len(detections) == 0 {
+		log.Printf("detection returned no boxes image=%s; using plain thumbnail", imageID)
+		return nil
+	}
+	return detections
 }
 
 func (w *worker) completeImage(imageID string, thumbKey string, hash string, width int, height int, size int64, format string, tags []platform.GeneratedTag) error {
@@ -263,32 +293,6 @@ func (w *worker) completeImage(imageID string, thumbKey string, hash string, wid
 			"error_message":  "",
 		}).Error
 	})
-}
-
-func (w *worker) analyzeTags(ctx context.Context, imageID string, originalKey string, originalName string, format string, img image.Image) []platform.GeneratedTag {
-	if w.analyzer == nil {
-		return platform.GenerateTags(img, originalName)
-	}
-	aiCtx, cancel := context.WithTimeout(ctx, w.cfg.AIRPCTimeout)
-	defer cancel()
-	imageURI := w.aiImageURI(aiCtx, originalKey)
-	tags, err := w.analyzer.Analyze(aiCtx, platform.AnalyzeImageRequest{
-		RequestID:   platform.NewID("ai_req"),
-		ImageID:     imageID,
-		ImageURI:    imageURI,
-		Filename:    originalName,
-		ContentType: "image/" + format,
-		Tasks:       []platform.AnalysisTask{{Type: "classification"}},
-		Params: map[string]string{
-			"storage_provider": string(w.storage.Provider()),
-			"storage_key":      originalKey,
-		},
-	})
-	if err != nil {
-		log.Printf("ai analyze failed image=%s err=%v; fallback to local tags", imageID, err)
-		return platform.GenerateTags(img, originalName)
-	}
-	return tags
 }
 
 func (w *worker) pollDatabase() error {
@@ -358,6 +362,13 @@ func (w *worker) aiImageURI(ctx context.Context, originalKey string) string {
 		return originalKey
 	}
 	return url
+}
+
+func (w *worker) detectionImageURI(ctx context.Context, originalKey string) string {
+	if w.storage.Provider() == platform.StorageProviderLocal {
+		return strings.TrimRight(w.cfg.PublicGatewayURL, "/") + platform.PublicFileURL("original", originalKey)
+	}
+	return w.aiImageURI(ctx, originalKey)
 }
 
 func value(msg redis.XMessage, key string) string {

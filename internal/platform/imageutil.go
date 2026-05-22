@@ -59,6 +59,71 @@ func CreateThumbnailJPEG(src image.Image, maxWidth int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func CreateDetectionThumbnailJPEG(src image.Image, maxWidth int, detections []Detection) ([]byte, error) {
+	thumb := ResizeToMaxWidth(src, maxWidth)
+	if thumb == nil {
+		return nil, nil
+	}
+	if len(detections) > 0 {
+		thumb = DrawDetections(thumb, src.Bounds(), detections)
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, thumb, &jpeg.Options{Quality: 86}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func DrawDetections(src image.Image, originalBounds image.Rectangle, detections []Detection) image.Image {
+	bounds := src.Bounds()
+	dst := image.NewRGBA(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			dst.Set(x, y, src.At(x, y))
+		}
+	}
+	origWidth := float64(originalBounds.Dx())
+	origHeight := float64(originalBounds.Dy())
+	if origWidth <= 0 || origHeight <= 0 {
+		return dst
+	}
+	scaleX := float64(bounds.Dx()) / origWidth
+	scaleY := float64(bounds.Dy()) / origHeight
+	red := color.RGBA{R: 255, A: 255}
+	thickness := max(2, bounds.Dx()/180)
+	for _, det := range detections {
+		box := det.Box
+		x1 := int(box.X * scaleX)
+		y1 := int(box.Y * scaleY)
+		x2 := int((box.X + box.Width) * scaleX)
+		y2 := int((box.Y + box.Height) * scaleY)
+		drawRect(dst, clamp(x1, 0, bounds.Dx()-1), clamp(y1, 0, bounds.Dy()-1), clamp(x2, 0, bounds.Dx()-1), clamp(y2, 0, bounds.Dy()-1), thickness, red)
+	}
+	return dst
+}
+
+func drawRect(img *image.RGBA, x1 int, y1 int, x2 int, y2 int, thickness int, c color.RGBA) {
+	if x2 < x1 {
+		x1, x2 = x2, x1
+	}
+	if y2 < y1 {
+		y1, y2 = y2, y1
+	}
+	if x2-x1 < 2 || y2-y1 < 2 {
+		return
+	}
+	for t := 0; t < thickness; t++ {
+		for x := x1; x <= x2; x++ {
+			img.SetRGBA(x, y1+t, c)
+			img.SetRGBA(x, y2-t, c)
+		}
+		for y := y1; y <= y2; y++ {
+			img.SetRGBA(x1+t, y, c)
+			img.SetRGBA(x2-t, y, c)
+		}
+	}
+}
+
 func ResizeToMaxWidth(src image.Image, maxWidth int) image.Image {
 	bounds := src.Bounds()
 	width := bounds.Dx()
@@ -83,6 +148,16 @@ func ResizeToMaxWidth(src image.Image, maxWidth int) image.Image {
 		}
 	}
 	return dst
+}
+
+func clamp(value int, minValue int, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
 }
 
 func DetectFormatFromName(name string) string {

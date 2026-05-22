@@ -34,8 +34,8 @@ device-simulator / pressure-test
   -> MySQL images/devices
   -> Redis Stream image_uploaded_stream
   -> worker
-  -> Storage 读取原图、写入缩略图
-  -> ai-service 读取原图并生成标签
+  -> Storage 读取原图、写入缩略图或红框检测图
+  -> ai-detection-service(可选，本机 GPU) 读取原图并返回检测框
   -> MySQL image_tags/images 状态更新
 ```
 
@@ -48,12 +48,11 @@ device-simulator / pressure-test
 5. `cloud-api` 在 MySQL 中创建图片记录，状态为 `queued`，同时更新或创建设备记录。`images.original_path` 保存当前存储中的 key，OBS 模式下还会写入 `original_storage_provider`、`original_bucket`、`original_object_key`、`original_object_url` 等字段。
 6. `cloud-api` 向 Redis Stream `image_uploaded_stream` 写入任务消息，消息中包含 `image_id`、`original_path`、`device_id`、`edge_node_id` 等信息。如果 Redis 不可用，worker 会降级轮询 MySQL 中的 `queued` 任务。
 7. `worker` 消费任务后把图片状态改为 `processing`，通过统一 `Storage.Get` 读取原图，不再直接依赖本地文件路径。
-8. `worker` 解码图片、计算 hash、读取尺寸和格式，并生成 JPEG 缩略图。缩略图通过统一 `Storage.Put` 写入：
+8. `worker` 解码图片、计算 hash、读取尺寸和格式，并生成 JPEG 缩略图。启用本机 GPU `ai-detection-service` 时，worker 会调用目标检测服务获取检测框，并把红框画到缩略图上。缩略图通过统一 `Storage.Put` 写入：
    - `LOCAL`：本地 `storage/thumbnail/...`。
    - `HUAWEI`：OBS 的 `thumbnail/...` 对象。
-9. `worker` 调用 `ai-service` 做标签分析。`LOCAL` 模式下传本地共享 volume 路径；`HUAWEI` 模式下优先传 OBS public URL，未配置公开 URL 时传临时签名 URL，同时在 gRPC `params` 中传递 `storage_provider` 和 `storage_key`。
-10. `ai-service` 读取图片，按当前规则分类逻辑生成标签。调用失败或超时时，worker 会降级使用 Go 本地规则标签，保证图片任务仍能完成。
-11. `worker` 把标签写入 `image_tags`，并更新 `images` 表中的 `thumbnail_path`、`width`、`height`、`format`、`size` 和状态 `completed`。失败时状态会变为 `failed`，并写入 `error_message`。
+9. `worker` 使用 Go 本地规则生成标签。目标检测服务不可用、超时或没有返回检测框时，worker 会降级生成普通缩略图，保证图片任务仍能完成。
+10. `worker` 把标签写入 `image_tags`，并更新 `images` 表中的 `thumbnail_path`、`width`、`height`、`format`、`size` 和状态 `completed`。失败时状态会变为 `failed`，并写入 `error_message`。
 
 ### Web 前端查看图片
 
@@ -505,6 +504,24 @@ pip install -r device-simulator/requirements.txt
 python device-simulator/simulator.py --device-id device_001 --interval 3
 ```
 
+默认会走完整链路上传到 edge-node：
+
+```text
+http://127.0.0.1:8081/api/edge/upload
+```
+
+如果要绕过 edge-node，直接通过 nginx 网关上传到 cloud-api：
+
+```powershell
+python device-simulator/simulator.py --route gateway --once
+```
+
+也可以完全手动指定上传地址：
+
+```powershell
+python device-simulator/simulator.py --upload-url http://127.0.0.1:5173/api/images/upload --once
+```
+
 可再开两个窗口模拟多设备：
 
 ```powershell
@@ -637,35 +654,60 @@ GET /api/tasks/status
 GET /api/stats
 ```
 
-## gRPC AI 服务
+## gRPC AI 与目标检测服务
 
-Worker 已经把标签生成重构为可选 gRPC 调用：
-
-```text
-worker -> ai-service:9000 -> /vision.v1.VisionAnalysisService/AnalyzeImage
-```
-
-第一版 `ai-service` 是 Python 服务，暂不接真实模型，只复刻原有规则标签逻辑。gRPC 请求只传图片 URI，不传图片 bytes：
+Worker 的 AI 通信使用同一套 gRPC 协议：
 
 ```text
-image_uri=/app/storage/original/img_xxx.jpg
+worker -> /vision.v1.VisionAnalysisService/AnalyzeImage
 ```
-
-相关配置：
-
-```text
-AI_RPC_ENABLED=true
-AI_RPC_ADDR=ai-service:9000
-AI_RPC_TIMEOUT_SECONDS=5
-```
-
-如果 `ai-service` 不可用、超时或无法读取图片，Worker 会自动降级为 Go 本地规则标签，图片任务仍会完成。
 
 协议文件：
 
 ```text
 proto/vision/v1/vision.proto
 ```
+
+Docker 内的 `ai-service` 是规则分类服务。当前 worker 默认不再依赖它，标签改为 Go 本地规则生成，保证链路简单稳定。
+
+新增的 `ai-detection-service` 是独立本机 GPU 服务，不放进 Docker。它使用 ModelScope 模型 `iic/cv_tinynas_head-detection_damoyolo` 做目标检测，返回 proto 中已有的 `detection.detections`。worker 会把检测框画到缩略图上，并继续写入原来的 `thumbnail/<image_id>.jpg`，前端无需修改。
+
+创建干净 conda 环境：
+
+```powershell
+cd ai-detection-service
+conda env create -f environment.yml
+cd ..
+```
+
+启动本机 GPU detection 服务：
+
+```powershell
+conda activate iot-detection-gpu
+python ai-detection-service\server.py
+```
+
+worker 连接 detection 服务的配置：
+
+```text
+DETECTION_RPC_ENABLED=true
+DETECTION_RPC_ADDR=host.docker.internal:9100
+DETECTION_RPC_TIMEOUT_SECONDS=10
+PUBLIC_GATEWAY_URL=http://127.0.0.1:5173
+```
+
+`PUBLIC_GATEWAY_URL` 是外部服务可访问的平台统一入口，用于 LOCAL 存储模式：worker 传给本机 detection 服务的图片地址会变成 `http://127.0.0.1:5173/files/original/...`，这样宿主机服务可以通过 nginx 网关读取容器内业务图片。HUAWEI 模式下，worker 仍优先传 OBS public URL 或 presigned URL。旧变量 `DETECTION_IMAGE_BASE_URL` 仍作为兼容 fallback 保留。
+
+如果 detection 服务不可用、超时或没有检测框，worker 会降级生成普通缩略图，图片任务仍会完成。
+
+VOC2028 冒烟测试：
+
+```powershell
+conda activate iot-detection-gpu
+python ai-detection-service\test_detection_voc2028.py --limit 10
+```
+
+脚本默认读取 `VOC2028/VOC2028/JPEGImages`，输出带红框图片到 `ai-detection-service/test-output/`。
 
 重新生成 Go/Python Protobuf 代码：
 
@@ -686,14 +728,13 @@ $env:PROTOC_PATH="D:\tools\protoc-35.0-rc-2-win64\bin\protoc.exe"
 .\generate-proto.cmd
 ```
 
-Worker 和 AI 服务均支持横向扩展：
+Worker 支持横向扩展：
 
 ```powershell
 docker compose up -d --scale worker=3 worker
-docker compose up -d --scale ai-service=3 ai-service
 ```
 
-`worker` 与 `ai-service` 都没有固定 `container_name`，多个实例不会发生容器命名冲突。
+本机 detection 服务默认是单实例 GPU 推理服务；如果要多个实例，需要使用不同端口启动并在 worker 前面增加负载均衡。
 
 ## Storage 抽象层
 

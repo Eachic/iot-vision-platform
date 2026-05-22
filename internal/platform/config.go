@@ -21,6 +21,10 @@ type Config struct {
 	AIRPCEnabled        bool
 	AIRPCAddr           string
 	AIRPCTimeout        time.Duration
+	DetectionRPCEnabled bool
+	DetectionRPCAddr    string
+	DetectionRPCTimeout time.Duration
+	PublicGatewayURL    string
 	JWTSecret           string
 	JWTExpireHours      int
 	DefaultAdmin        string
@@ -44,6 +48,10 @@ func LoadConfig() Config {
 		AIRPCEnabled:        envBool("AI_RPC_ENABLED", true),
 		AIRPCAddr:           env("AI_RPC_ADDR", "127.0.0.1:9000"),
 		AIRPCTimeout:        time.Duration(envInt("AI_RPC_TIMEOUT_SECONDS", 5)) * time.Second,
+		DetectionRPCEnabled: envBool("DETECTION_RPC_ENABLED", false),
+		DetectionRPCAddr:    env("DETECTION_RPC_ADDR", "127.0.0.1:9100"),
+		DetectionRPCTimeout: time.Duration(envInt("DETECTION_RPC_TIMEOUT_SECONDS", 10)) * time.Second,
+		PublicGatewayURL:    strings.TrimRight(envFirst("http://127.0.0.1:5173", "PUBLIC_GATEWAY_URL", "DETECTION_IMAGE_BASE_URL"), "/"),
 		JWTSecret:           env("JWT_SECRET", "course-demo-jwt-secret"),
 		JWTExpireHours:      envInt("JWT_EXPIRE_HOURS", 24),
 		DefaultAdmin:        env("DEFAULT_ADMIN_USERNAME", "admin"),
@@ -52,6 +60,15 @@ func LoadConfig() Config {
 		EdgeNodeAddr:        env("EDGE_NODE_ADDR", ":8081"),
 		CloudUploadURL:      env("CLOUD_UPLOAD_URL", "http://127.0.0.1:8080/api/images/upload"),
 	}
+}
+
+func envFirst(fallback string, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return fallback
 }
 
 func env(key string, fallback string) string {

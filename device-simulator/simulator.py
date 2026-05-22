@@ -1,5 +1,6 @@
 import argparse
 import itertools
+import os
 import random
 import time
 from datetime import datetime, timezone
@@ -7,6 +8,12 @@ from pathlib import Path
 
 import requests
 from PIL import Image, ImageDraw
+
+
+DEFAULT_TARGETS = {
+    "edge": "http://127.0.0.1:8081/api/edge/upload",
+    "gateway": "http://127.0.0.1:5173/api/images/upload",
+}
 
 
 def ensure_samples(image_dir: Path) -> None:
@@ -39,7 +46,7 @@ def iter_images(image_dir: Path):
         yield from shuffled
 
 
-def upload(edge_url: str, token: str, device_id: str, edge_node_id: str, path: Path) -> None:
+def upload(upload_url: str, token: str, device_id: str, edge_node_id: str, path: Path) -> None:
     with path.open("rb") as fh:
         files = {"file": (path.name, fh, "application/octet-stream")}
         data = {
@@ -48,7 +55,7 @@ def upload(edge_url: str, token: str, device_id: str, edge_node_id: str, path: P
             "captured_at": datetime.now(timezone.utc).isoformat(),
         }
         resp = requests.post(
-            edge_url,
+            upload_url,
             headers={"X-Device-Token": token},
             files=files,
             data=data,
@@ -59,22 +66,32 @@ def upload(edge_url: str, token: str, device_id: str, edge_node_id: str, path: P
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Simulate IoT camera devices uploading images to the edge node.")
-    parser.add_argument("--device-id", default="device_001")
-    parser.add_argument("--edge-node-id", default="edge_001")
-    parser.add_argument("--edge-url", default="http://127.0.0.1:8081/api/edge/upload")
-    parser.add_argument("--interval", type=float, default=3.0)
-    parser.add_argument("--image-dir", default="./sample-images")
-    parser.add_argument("--token", default="course-demo-token")
+    parser = argparse.ArgumentParser(description="Simulate IoT camera devices uploading images to the platform.")
+    parser.add_argument("--device-id", default=os.getenv("DEVICE_ID", "device_001"))
+    parser.add_argument("--edge-node-id", default=os.getenv("EDGE_NODE_ID", "edge_001"))
+    parser.add_argument("--route", choices=sorted(DEFAULT_TARGETS), default=os.getenv("SIMULATOR_ROUTE", "edge"))
+    parser.add_argument("--edge-url", default=os.getenv("EDGE_UPLOAD_URL", DEFAULT_TARGETS["edge"]))
+    parser.add_argument("--gateway-url", default=os.getenv("GATEWAY_UPLOAD_URL", DEFAULT_TARGETS["gateway"]))
+    parser.add_argument("--upload-url", default=os.getenv("UPLOAD_URL", ""))
+    parser.add_argument("--interval", type=float, default=float(os.getenv("UPLOAD_INTERVAL_SECONDS", "3.0")))
+    parser.add_argument("--image-dir", default=os.getenv("IMAGE_DIR", "./VOC2028/VOC2028/JPEGImages"))
+    parser.add_argument("--token", default=os.getenv("DEVICE_TOKEN", "course-demo-token"))
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
+
+    targets = {
+        "edge": args.edge_url,
+        "gateway": args.gateway_url,
+    }
+    upload_url = args.upload_url or targets[args.route]
+    print(f"[simulator] route={args.route} upload_url={upload_url}")
 
     image_dir = Path(args.image_dir)
     ensure_samples(image_dir)
     images = iter_images(image_dir)
     for path in itertools.islice(images, 1 if args.once else None):
         try:
-            upload(args.edge_url, args.token, args.device_id, args.edge_node_id, path)
+            upload(upload_url, args.token, args.device_id, args.edge_node_id, path)
         except Exception as exc:
             print(f"[{args.device_id}] upload failed: {exc}")
         if args.once:
