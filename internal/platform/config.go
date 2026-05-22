@@ -32,6 +32,10 @@ type Config struct {
 	CloudAPIAddr        string
 	EdgeNodeAddr        string
 	CloudUploadURL      string
+	MQTTEnabled         bool
+	MQTTBroker          string
+	MQTTTopic           string
+	MQTTClientID        string
 }
 
 func LoadConfig() Config {
@@ -59,6 +63,10 @@ func LoadConfig() Config {
 		CloudAPIAddr:        env("CLOUD_API_ADDR", ":8080"),
 		EdgeNodeAddr:        env("EDGE_NODE_ADDR", ":8081"),
 		CloudUploadURL:      env("CLOUD_UPLOAD_URL", "http://127.0.0.1:8080/api/images/upload"),
+		MQTTEnabled:         envBool("MQTT_ENABLED", false),
+		MQTTBroker:          env("MQTT_BROKER", "tcp://127.0.0.1:1883"),
+		MQTTTopic:           env("MQTT_TOPIC", "iot/images/+"),
+		MQTTClientID:        env("MQTT_CLIENT_ID", "edge-node-001"),
 	}
 }
 

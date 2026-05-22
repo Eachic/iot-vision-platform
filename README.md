@@ -27,7 +27,9 @@ iot-vision-platform/
 
 ```text
 device-simulator / pressure-test
-  -> edge-node :8081 /api/edge/upload
+  -> HTTP edge-node :8081 /api/edge/upload
+  -> MQTT mqtt-broker :1883 iot/images/{device_id}
+  -> edge-node MQTT consumer
   -> nginx gateway(frontend :5173) /api/images/upload
   -> cloud-api :8080
   -> Storage(LOCAL 或 HUAWEI OBS)
@@ -39,20 +41,21 @@ device-simulator / pressure-test
   -> MySQL image_tags/images 状态更新
 ```
 
-1. 端侧设备通过 HTTP multipart 上传图片到 `edge-node`，请求需要携带 `X-Device-Token`，并提交 `device_id`、`edge_node_id`、`captured_at` 等表单字段。
-2. `edge-node` 校验设备 token，计算图片 SHA256。启用 `EDGE_DEDUP_ENABLED=true` 时，重复图片会在边缘侧直接过滤，减少云端压力。
-3. `edge-node` 把图片转发到 `cloud-api`。如果云端暂时不可用，图片和元数据会写入本地 `storage/edge-cache`，后台重试循环会定时重新转发。
-4. `cloud-api` 再次校验设备 token，并通过统一 `Storage` 接口保存原图：
+1. 端侧设备可以通过 HTTP multipart 上传图片到 `edge-node`，也可以通过 MQTT 发布 JSON + base64 单消息到 `iot/images/{device_id}`。
+2. HTTP 请求通过 `X-Device-Token` 鉴权；MQTT 消息通过 JSON payload 中的 `token` 字段鉴权。两种入口都会提交 `device_id`、`edge_node_id`、`captured_at` 等字段。
+3. `edge-node` 校验设备 token，计算图片 SHA256。启用 `EDGE_DEDUP_ENABLED=true` 时，重复图片会在边缘侧直接过滤，减少云端压力。
+4. `edge-node` 把图片转发到 `cloud-api`。如果云端暂时不可用，图片和元数据会写入本地 `storage/edge-cache`，后台重试循环会定时重新转发。
+5. `cloud-api` 再次校验设备 token，并通过统一 `Storage` 接口保存原图：
    - `STORAGE_PROVIDER=LOCAL`：写入本地 `storage/original/...`。
    - `STORAGE_PROVIDER=HUAWEI`：写入华为 OBS 的 `original/...` 对象。
-5. `cloud-api` 在 MySQL 中创建图片记录，状态为 `queued`，同时更新或创建设备记录。`images.original_path` 保存当前存储中的 key，OBS 模式下还会写入 `original_storage_provider`、`original_bucket`、`original_object_key`、`original_object_url` 等字段。
-6. `cloud-api` 向 Redis Stream `image_uploaded_stream` 写入任务消息，消息中包含 `image_id`、`original_path`、`device_id`、`edge_node_id` 等信息。如果 Redis 不可用，worker 会降级轮询 MySQL 中的 `queued` 任务。
-7. `worker` 消费任务后把图片状态改为 `processing`，通过统一 `Storage.Get` 读取原图，不再直接依赖本地文件路径。
-8. `worker` 解码图片、计算 hash、读取尺寸和格式，并生成 JPEG 缩略图。启用本机 GPU `ai-detection-service` 时，worker 会调用目标检测服务获取检测框，并把红框画到缩略图上。缩略图通过统一 `Storage.Put` 写入：
+6. `cloud-api` 在 MySQL 中创建图片记录，状态为 `queued`，同时更新或创建设备记录。`images.original_path` 保存当前存储中的 key，OBS 模式下还会写入 `original_storage_provider`、`original_bucket`、`original_object_key`、`original_object_url` 等字段。
+7. `cloud-api` 向 Redis Stream `image_uploaded_stream` 写入任务消息，消息中包含 `image_id`、`original_path`、`device_id`、`edge_node_id` 等信息。如果 Redis 不可用，worker 会降级轮询 MySQL 中的 `queued` 任务。
+8. `worker` 消费任务后把图片状态改为 `processing`，通过统一 `Storage.Get` 读取原图，不再直接依赖本地文件路径。
+9. `worker` 解码图片、计算 hash、读取尺寸和格式，并生成 JPEG 缩略图。启用本机 GPU `ai-detection-service` 时，worker 会调用目标检测服务获取检测框，并把红框画到缩略图上。缩略图通过统一 `Storage.Put` 写入：
    - `LOCAL`：本地 `storage/thumbnail/...`。
    - `HUAWEI`：OBS 的 `thumbnail/...` 对象。
-9. `worker` 使用 Go 本地规则生成标签。目标检测服务不可用、超时或没有返回检测框时，worker 会降级生成普通缩略图，保证图片任务仍能完成。
-10. `worker` 把标签写入 `image_tags`，并更新 `images` 表中的 `thumbnail_path`、`width`、`height`、`format`、`size` 和状态 `completed`。失败时状态会变为 `failed`，并写入 `error_message`。
+10. `worker` 使用 Go 本地规则生成标签。目标检测服务不可用、超时或没有返回检测框时，worker 会降级生成普通缩略图，保证图片任务仍能完成。
+11. `worker` 把标签写入 `image_tags`，并更新 `images` 表中的 `thumbnail_path`、`width`、`height`、`format`、`size` 和状态 `completed`。失败时状态会变为 `failed`，并写入 `error_message`。
 
 ### Web 前端查看图片
 
@@ -295,12 +298,6 @@ docker compose up -d --scale cloud-api=3 cloud-api frontend
 docker compose restart frontend
 ```
 
-启动一个容器内设备模拟器：
-
-```powershell
-docker compose --profile simulator up --build -d simulator
-```
-
 停止 Docker 版本：
 
 ```powershell
@@ -319,6 +316,7 @@ Docker 版本默认端口：
 frontend/nginx gateway: http://127.0.0.1:5173
 API health:             http://127.0.0.1:5173/api/health
 edge-node:              http://127.0.0.1:8081
+mqtt broker:            tcp://127.0.0.1:1884
 mysql:                  127.0.0.1:3307
 redis:                  127.0.0.1:6379
 ```
@@ -504,7 +502,7 @@ pip install -r device-simulator/requirements.txt
 python device-simulator/simulator.py --device-id device_001 --interval 3
 ```
 
-默认会走完整链路上传到 edge-node：
+默认使用 HTTP 协议并走完整链路上传到 edge-node：
 
 ```text
 http://127.0.0.1:8081/api/edge/upload
@@ -515,6 +513,14 @@ http://127.0.0.1:8081/api/edge/upload
 ```powershell
 python device-simulator/simulator.py --route gateway --once
 ```
+
+如果要通过 MQTT 上传，先确保 Docker 中的 `mqtt-broker` 和 `edge-node` 已启动，然后运行：
+
+```powershell
+python device-simulator/simulator.py --protocol mqtt --once
+```
+
+MQTT 模式会发布到 `iot/images/{device_id}`，payload 是 JSON + base64 单消息。
 
 也可以完全手动指定上传地址：
 

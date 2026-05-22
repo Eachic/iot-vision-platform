@@ -1,7 +1,11 @@
 import argparse
+import base64
 import itertools
+import json
+import mimetypes
 import os
 import random
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,18 +69,102 @@ def upload(upload_url: str, token: str, device_id: str, edge_node_id: str, path:
     resp.raise_for_status()
 
 
+class MqttDeviceClient:
+    def __init__(self, broker: str, topic_prefix: str, token: str, device_id: str, edge_node_id: str):
+        import paho.mqtt.client as mqtt
+
+        self.mqtt = mqtt
+        self.broker = broker
+        self.topic = f"{topic_prefix.rstrip('/')}/{device_id}"
+        self.token = token
+        self.device_id = device_id
+        self.edge_node_id = edge_node_id
+        self.connected = threading.Event()
+        self.connect_errors = []
+        host, port = parse_mqtt_broker(broker)
+        self.host = host
+        self.port = port
+        self.client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id=f"simulator-{device_id}",
+        )
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties):
+        code = getattr(reason_code, "value", reason_code)
+        if code == 0 or str(reason_code).lower() == "success":
+            self.connect_errors.clear()
+            self.connected.set()
+            return
+        self.connect_errors.append(reason_code)
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        self.connected.clear()
+
+    def connect(self) -> None:
+        self.client.loop_start()
+        rc = self.client.connect(self.host, self.port, keepalive=30)
+        if rc != self.mqtt.MQTT_ERR_SUCCESS:
+            raise RuntimeError(f"mqtt connect failed rc={rc}")
+        if not self.connected.wait(timeout=10):
+            detail = f" reason={self.connect_errors[-1]}" if self.connect_errors else ""
+            raise TimeoutError(f"mqtt connect timeout broker={self.broker}{detail}")
+        print(f"[{self.device_id}] mqtt connected broker={self.broker} topic={self.topic}")
+
+    def publish_image(self, path: Path) -> None:
+        if not self.connected.is_set():
+            raise RuntimeError("mqtt client is disconnected")
+        content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        payload = {
+            "device_id": self.device_id,
+            "edge_node_id": self.edge_node_id,
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "filename": path.name,
+            "content_type": content_type,
+            "token": self.token,
+            "image_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+        }
+        result = self.client.publish(self.topic, json.dumps(payload), qos=1)
+        result.wait_for_publish(timeout=20)
+        if result.rc != self.mqtt.MQTT_ERR_SUCCESS or not result.is_published():
+            raise RuntimeError(f"mqtt publish failed rc={result.rc}")
+        print(f"[{self.device_id}] {path.name} -> mqtt {self.broker} topic={self.topic}")
+
+    def close(self) -> None:
+        try:
+            if self.connected.is_set():
+                self.client.disconnect()
+        finally:
+            self.client.loop_stop()
+
+
+def parse_mqtt_broker(raw: str):
+    broker = raw.strip()
+    if broker.startswith("tcp://"):
+        broker = broker[len("tcp://") :]
+    if ":" not in broker:
+        return broker, 1883
+    host, port = broker.rsplit(":", 1)
+    return host, int(port)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Simulate IoT camera devices uploading images to the platform.")
     parser.add_argument("--device-id", default=os.getenv("DEVICE_ID", "device_001"))
     parser.add_argument("--edge-node-id", default=os.getenv("EDGE_NODE_ID", "edge_001"))
     parser.add_argument("--route", choices=sorted(DEFAULT_TARGETS), default=os.getenv("SIMULATOR_ROUTE", "edge"))
+    parser.add_argument("--protocol", choices=["http", "mqtt"], default=os.getenv("SIMULATOR_PROTOCOL", "http"))
     parser.add_argument("--edge-url", default=os.getenv("EDGE_UPLOAD_URL", DEFAULT_TARGETS["edge"]))
     parser.add_argument("--gateway-url", default=os.getenv("GATEWAY_UPLOAD_URL", DEFAULT_TARGETS["gateway"]))
     parser.add_argument("--upload-url", default=os.getenv("UPLOAD_URL", ""))
+    parser.add_argument("--mqtt-broker", default=os.getenv("MQTT_BROKER", "tcp://127.0.0.1:1884"))
+    parser.add_argument("--mqtt-topic-prefix", default=os.getenv("MQTT_TOPIC_PREFIX", "iot/images"))
     parser.add_argument("--interval", type=float, default=float(os.getenv("UPLOAD_INTERVAL_SECONDS", "3.0")))
     parser.add_argument("--image-dir", default=os.getenv("IMAGE_DIR", "./VOC2028/VOC2028/JPEGImages"))
     parser.add_argument("--token", default=os.getenv("DEVICE_TOKEN", "course-demo-token"))
     parser.add_argument("--once", action="store_true")
+    parser.add_argument("--count", type=int, default=0, help="Number of images to upload. 0 means run forever unless --once is set.")
     args = parser.parse_args()
 
     targets = {
@@ -84,19 +172,46 @@ def main():
         "gateway": args.gateway_url,
     }
     upload_url = args.upload_url or targets[args.route]
-    print(f"[simulator] route={args.route} upload_url={upload_url}")
+    if args.protocol == "http":
+        print(f"[simulator] protocol=http route={args.route} upload_url={upload_url}")
+    else:
+        print(f"[simulator] protocol=mqtt broker={args.mqtt_broker} topic_prefix={args.mqtt_topic_prefix}")
 
     image_dir = Path(args.image_dir)
     ensure_samples(image_dir)
     images = iter_images(image_dir)
-    for path in itertools.islice(images, 1 if args.once else None):
+    mqtt_client = None
+    if args.protocol == "mqtt":
+        mqtt_client = MqttDeviceClient(
+            args.mqtt_broker,
+            args.mqtt_topic_prefix,
+            args.token,
+            args.device_id,
+            args.edge_node_id,
+        )
         try:
-            upload(upload_url, args.token, args.device_id, args.edge_node_id, path)
+            mqtt_client.connect()
         except Exception as exc:
-            print(f"[{args.device_id}] upload failed: {exc}")
-        if args.once:
-            break
-        time.sleep(args.interval)
+            print(f"[{args.device_id}] mqtt connect failed: {exc}")
+            mqtt_client.close()
+            return
+
+    try:
+        limit = 1 if args.once else (args.count if args.count > 0 else None)
+        for path in itertools.islice(images, limit):
+            try:
+                if mqtt_client:
+                    mqtt_client.publish_image(path)
+                else:
+                    upload(upload_url, args.token, args.device_id, args.edge_node_id, path)
+            except Exception as exc:
+                print(f"[{args.device_id}] upload failed: {exc}")
+            if args.once:
+                break
+            time.sleep(args.interval)
+    finally:
+        if mqtt_client:
+            mqtt_client.close()
 
 
 if __name__ == "__main__":

@@ -35,6 +35,15 @@ services:
       timeout: 3s
       retries: 30
 
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: iot-vision-mqtt
+    restart: unless-stopped
+    ports:
+      - "1884:1883"
+    volumes:
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
   cloud-api:
     build:
       context: .
@@ -161,6 +170,10 @@ services:
       EDGE_DEDUP_ENABLED: "false"
       EDGE_NODE_ADDR: :8081
       CLOUD_UPLOAD_URL: http://frontend/api/images/upload
+      MQTT_ENABLED: ${MQTT_ENABLED:-true}
+      MQTT_BROKER: tcp://mqtt-broker:1883
+      MQTT_TOPIC: ${MQTT_TOPIC:-iot/images/+}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-edge-node-001}
       TZ: Asia/Shanghai
     ports:
       - "8081:8081"
@@ -169,6 +182,8 @@ services:
     depends_on:
       frontend:
         condition: service_healthy
+      mqtt-broker:
+        condition: service_started
 
   frontend:
     build:
@@ -188,27 +203,6 @@ services:
       interval: 8s
       timeout: 3s
       retries: 20
-
-  simulator:
-    build:
-      context: ./device-simulator
-      dockerfile: Dockerfile
-      args:
-        IMAGE_REGISTRY: docker.m.daocloud.io/library
-    container_name: iot-vision-simulator
-    profiles:
-      - simulator
-    environment:
-      DEVICE_ID: device_docker_001
-      SIMULATOR_ROUTE: edge
-      EDGE_UPLOAD_URL: http://edge-node:8081/api/edge/upload
-      GATEWAY_UPLOAD_URL: http://frontend/api/images/upload
-      UPLOAD_INTERVAL_SECONDS: "3"
-      DEVICE_TOKEN: course-demo-token
-      TZ: Asia/Shanghai
-    depends_on:
-      edge-node:
-        condition: service_started
 
 volumes:
   mysql-data:
