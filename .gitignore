@@ -22,3 +22,4 @@ tools/
 *.exe
 VOC2028/*
 *.zip
+doc/*

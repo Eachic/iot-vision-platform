@@ -8,6 +8,7 @@ require (
 	github.com/go-redis/redis/v8 v8.11.5
 	github.com/go-sql-driver/mysql v1.7.0
 	github.com/huaweicloud/huaweicloud-sdk-go-obs v3.26.3+incompatible
+	github.com/rabbitmq/amqp091-go v1.10.0
 	golang.org/x/crypto v0.48.0
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11

@@ -35,6 +35,25 @@ services:
       timeout: 3s
       retries: 30
 
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: iot-vision-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: iot_user
+      RABBITMQ_DEFAULT_PASS: iot_password
+      TZ: Asia/Shanghai
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 8s
+      timeout: 5s
+      retries: 20
+
   mqtt-broker:
     image: eclipse-mosquitto:2
     container_name: iot-vision-mqtt
@@ -57,6 +76,13 @@ services:
       MYSQL_DSN: iot_user:iot_password@tcp(mysql:3306)/iot_vision?charset=utf8mb4&parseTime=True&loc=Local
       REDIS_ADDR: redis:6379
       REDIS_PASSWORD: ""
+      RABBITMQ_URL: amqp://iot_user:iot_password@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-image.tasks}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-image.process}
+      RABBITMQ_ROUTING_KEY: ${RABBITMQ_ROUTING_KEY:-image.uploaded}
+      RABBITMQ_PREFETCH: ${RABBITMQ_PREFETCH:-1}
+      RABBITMQ_RETRY_DELAY_MS: ${RABBITMQ_RETRY_DELAY_MS:-5000}
+      RABBITMQ_MAX_RETRIES: ${RABBITMQ_MAX_RETRIES:-3}
       STORAGE_ROOT: /app/storage
       STORAGE_PROVIDER: ${STORAGE_PROVIDER:-LOCAL}
       STORAGE_OBJECT_PREFIX: ${STORAGE_OBJECT_PREFIX:-original}
@@ -84,6 +110,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/api/health"]
       interval: 8s
@@ -101,8 +129,13 @@ services:
     restart: unless-stopped
     environment:
       MYSQL_DSN: iot_user:iot_password@tcp(mysql:3306)/iot_vision?charset=utf8mb4&parseTime=True&loc=Local
-      REDIS_ADDR: redis:6379
-      REDIS_PASSWORD: ""
+      RABBITMQ_URL: amqp://iot_user:iot_password@rabbitmq:5672/
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-image.tasks}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE:-image.process}
+      RABBITMQ_ROUTING_KEY: ${RABBITMQ_ROUTING_KEY:-image.uploaded}
+      RABBITMQ_PREFETCH: ${RABBITMQ_PREFETCH:-1}
+      RABBITMQ_RETRY_DELAY_MS: ${RABBITMQ_RETRY_DELAY_MS:-5000}
+      RABBITMQ_MAX_RETRIES: ${RABBITMQ_MAX_RETRIES:-3}
       STORAGE_ROOT: /app/storage
       STORAGE_PROVIDER: ${STORAGE_PROVIDER:-LOCAL}
       STORAGE_OBJECT_PREFIX: ${STORAGE_OBJECT_PREFIX:-original}
@@ -127,7 +160,7 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-      redis:
+      rabbitmq:
         condition: service_healthy
 
   ai-service:
@@ -207,4 +240,5 @@ services:
 volumes:
   mysql-data:
   redis-data:
+  rabbitmq-data:
   app-storage:

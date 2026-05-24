@@ -36,6 +36,13 @@ type Config struct {
 	MQTTBroker          string
 	MQTTTopic           string
 	MQTTClientID        string
+	RabbitMQURL         string
+	RabbitMQExchange    string
+	RabbitMQQueue       string
+	RabbitMQRoutingKey  string
+	RabbitMQPrefetch    int
+	RabbitMQRetryDelay  time.Duration
+	RabbitMQMaxRetries  int
 }
 
 func LoadConfig() Config {
@@ -67,6 +74,13 @@ func LoadConfig() Config {
 		MQTTBroker:          env("MQTT_BROKER", "tcp://127.0.0.1:1883"),
 		MQTTTopic:           env("MQTT_TOPIC", "iot/images/+"),
 		MQTTClientID:        env("MQTT_CLIENT_ID", "edge-node-001"),
+		RabbitMQURL:         env("RABBITMQ_URL", "amqp://iot_user:iot_password@127.0.0.1:5672/"),
+		RabbitMQExchange:    env("RABBITMQ_EXCHANGE", "image.tasks"),
+		RabbitMQQueue:       env("RABBITMQ_QUEUE", "image.process"),
+		RabbitMQRoutingKey:  env("RABBITMQ_ROUTING_KEY", "image.uploaded"),
+		RabbitMQPrefetch:    envInt("RABBITMQ_PREFETCH", 1),
+		RabbitMQRetryDelay:  time.Duration(envInt("RABBITMQ_RETRY_DELAY_MS", 5000)) * time.Millisecond,
+		RabbitMQMaxRetries:  envInt("RABBITMQ_MAX_RETRIES", 3),
 	}
 }
 

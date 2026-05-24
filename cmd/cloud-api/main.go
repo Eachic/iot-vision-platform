@@ -44,10 +44,11 @@ const (
 )
 
 type app struct {
-	cfg     platform.Config
-	db      *gorm.DB
-	redis   *redis.Client
-	storage platform.Storage
+	cfg       platform.Config
+	db        *gorm.DB
+	redis     *redis.Client
+	storage   platform.Storage
+	taskQueue *platform.RabbitMQTaskQueue
 }
 
 type imageResponse struct {
@@ -85,7 +86,7 @@ func main() {
 	}
 	rdb := platform.OpenRedis(cfg)
 	if err := platform.PingRedis(context.Background(), rdb); err != nil {
-		log.Printf("redis unavailable, uploads will rely on database polling fallback: %v", err)
+		log.Printf("redis unavailable, query cache disabled: %v", err)
 		rdb = nil
 	}
 
@@ -94,7 +95,14 @@ func main() {
 		panic(err)
 	}
 	log.Printf("storage provider %s bucket=%s", storage.Provider(), storage.Bucket())
-	a := &app{cfg: cfg, db: db, redis: rdb, storage: storage}
+	taskQueue, err := platform.NewRabbitMQTaskQueue(cfg)
+	if err != nil {
+		log.Printf("rabbitmq unavailable, uploads will rely on database polling fallback: %v", err)
+	} else {
+		defer taskQueue.Close()
+		log.Printf("rabbitmq task queue enabled url=%s exchange=%s queue=%s", cfg.RabbitMQURL, cfg.RabbitMQExchange, cfg.RabbitMQQueue)
+	}
+	a := &app{cfg: cfg, db: db, redis: rdb, storage: storage, taskQueue: taskQueue}
 	if err := a.ensureDefaultAdmin(); err != nil {
 		panic(err)
 	}
@@ -599,20 +607,17 @@ func (a *app) invalidateDashboardCache(ctx context.Context) {
 }
 
 func (a *app) enqueueImage(ctx context.Context, record platform.ImageRecord) error {
-	if a.redis == nil {
+	if a.taskQueue == nil {
 		return nil
 	}
-	return a.redis.XAdd(ctx, &redis.XAddArgs{
-		Stream: "image_uploaded_stream",
-		Values: map[string]interface{}{
-			"image_id":      record.ImageID,
-			"original_path": record.OriginalPath,
-			"device_id":     record.DeviceID,
-			"edge_node_id":  record.EdgeNodeID,
-			"original_name": filepath.Base(record.OriginalPath),
-			"thumbnail_dir": filepath.ToSlash(filepath.Join(a.cfg.StorageRoot, "thumbnail")),
-		},
-	}).Err()
+	return a.taskQueue.PublishImageTask(ctx, platform.ImageTask{
+		ImageID:      record.ImageID,
+		OriginalPath: record.OriginalPath,
+		DeviceID:     record.DeviceID,
+		EdgeNodeID:   record.EdgeNodeID,
+		OriginalName: filepath.Base(record.OriginalPath),
+		ThumbnailDir: filepath.ToSlash(filepath.Join(a.cfg.StorageRoot, "thumbnail")),
+	})
 }
 
 func saveUploadedObject(ctx context.Context, storage platform.Storage, fileHeader *multipart.FileHeader, key string, contentType string, metadata map[string]string) (platform.StoredObject, string, int64, error) {

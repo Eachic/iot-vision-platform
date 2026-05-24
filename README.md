@@ -1,6 +1,6 @@
 # 基于云边端协同的物联网视觉数据平台
 
-这是一个用于《物联网技术与应用》课程报告的 MVP 项目，覆盖端侧采集、边缘去重、云端存储、Redis Stream 流处理、Redis 短 TTL 查询缓存、Worker 异步图片处理、MySQL 元数据管理和 Vue 可视化展示。
+这是一个用于《物联网技术与应用》课程报告的 MVP 项目，覆盖端侧采集、边缘去重、云端存储、RabbitMQ 队列处理、Redis 短 TTL 查询缓存、Worker 异步图片处理、MySQL 元数据管理和 Vue 可视化展示。
 
 ## 目录结构
 
@@ -9,13 +9,13 @@ iot-vision-platform/
 ├── cmd/
 │   ├── cloud-api/      # 云端 API 服务
 │   ├── edge-node/      # 边缘节点服务
-│   └── worker/         # Redis Stream 图片处理 Worker
+│   └── worker/         # RabbitMQ 图片处理 Worker
 ├── device-simulator/   # Python 设备模拟器
 ├── frontend/           # Vue3 前端
 ├── deploy/mysql/       # MySQL 初始化 SQL
 ├── internal/platform/  # Go 共享配置、模型、图片处理工具
 ├── storage/            # 运行时图片和边缘缓存目录
-├── docker-compose.yml  # 默认只启动 Redis
+├── docker-compose.yml  # Docker 编排配置
 └── .env.example
 ```
 
@@ -34,7 +34,7 @@ device-simulator / pressure-test
   -> cloud-api :8080
   -> Storage(LOCAL 或 HUAWEI OBS)
   -> MySQL images/devices
-  -> Redis Stream image_uploaded_stream
+  -> RabbitMQ image.process
   -> worker
   -> Storage 读取原图、写入缩略图或红框检测图
   -> ai-detection-service(可选，本机 GPU) 读取原图并返回检测框
@@ -49,7 +49,7 @@ device-simulator / pressure-test
    - `STORAGE_PROVIDER=LOCAL`：写入本地 `storage/original/...`。
    - `STORAGE_PROVIDER=HUAWEI`：写入华为 OBS 的 `original/...` 对象。
 6. `cloud-api` 在 MySQL 中创建图片记录，状态为 `queued`，同时更新或创建设备记录。`images.original_path` 保存当前存储中的 key，OBS 模式下还会写入 `original_storage_provider`、`original_bucket`、`original_object_key`、`original_object_url` 等字段。
-7. `cloud-api` 向 Redis Stream `image_uploaded_stream` 写入任务消息，消息中包含 `image_id`、`original_path`、`device_id`、`edge_node_id` 等信息。如果 Redis 不可用，worker 会降级轮询 MySQL 中的 `queued` 任务。
+7. `cloud-api` 向 RabbitMQ `image.process` 队列写入持久化任务消息，消息中包含 `image_id`、`original_path`、`device_id`、`edge_node_id` 等信息。如果 RabbitMQ 启动时不可用，worker 会降级轮询 MySQL 中的 `queued` 任务。
 8. `worker` 消费任务后把图片状态改为 `processing`，通过统一 `Storage.Get` 读取原图，不再直接依赖本地文件路径。
 9. `worker` 解码图片、计算 hash、读取尺寸和格式，并生成 JPEG 缩略图。启用本机 GPU `ai-detection-service` 时，worker 会调用目标检测服务获取检测框，并把红框画到缩略图上。缩略图通过统一 `Storage.Put` 写入：
    - `LOCAL`：本地 `storage/thumbnail/...`。
@@ -84,11 +84,11 @@ browser(Vue :5173)
 7. 前端用 `<img>` 直接加载 `thumbnail_url` 显示图库缩略图；用户点击图片后，弹窗使用 `original_url` 加载原图，并展示设备、标签、尺寸、大小、格式和采集时间。
 8. 前端每 5 秒刷新一次数据，因此图片状态会从 `queued`、`processing` 自动变为 `completed`，缩略图和标签也会在 worker 处理完成后出现在页面上。
 
-### Redis 缓存层
+### RabbitMQ 队列与 Redis 缓存层
 
-Redis 在当前项目里承担两类职责：
+当前项目把异步任务队列和查询缓存拆开：
 
-- 消息队列：`cloud-api` 上传成功后向 Redis Stream `image_uploaded_stream` 写入图片处理任务，worker 通过 consumer group 并行消费。
+- 消息队列：`cloud-api` 上传成功后向 RabbitMQ `image.process` 写入图片处理任务，worker 通过 manual ack 和 `prefetch=1` 并行消费。
 - 查询缓存：`cloud-api` 对高频聚合接口使用短 TTL JSON 缓存，降低前端轮询时对 MySQL 的重复查询压力。
 
 当前缓存范围：
@@ -104,9 +104,11 @@ Redis 在当前项目里承担两类职责：
 
 缓存一致性采用“短 TTL + 上传后主动失效”的方式：`cloud-api` 每次成功接收新图片后会删除以上缓存 key，让新增图片和设备尽快体现在前端；worker 更新任务状态和标签时不主动操作 cloud-api 缓存，依赖 `/api/tasks/status` 与默认图片列表的短 TTL 快速收敛。Redis 不可用时，接口会自动回退到 MySQL 查询，核心上传和展示链路仍可运行。
 
+RabbitMQ 使用 direct exchange `image.tasks`、主队列 `image.process` 和固定延迟 retry queue。worker 只有在处理完成或业务失败已写入 MySQL 后才 ack；可重试数据库错误会进入 retry queue，默认 5 秒后回到主队列，超过 3 次后图片会被标记为 `failed`。
+
 `/api/tasks/status` 还会顺带清理异常中断留下的孤儿任务：如果某张图片保持 `processing` 超过 10 分钟，说明 worker 很可能在处理过程中被停止或重启，`cloud-api` 会把这类记录标记为 `failed` 并写入超时错误信息，避免前端任务状态长期卡在“处理中”。
 
-多个 worker 高并发写入 MySQL 时，`image_tags` 删除、插入和 `images` 状态更新可能遇到 MySQL 死锁 `Error 1213 (40001)` 或锁等待超时。worker 会对这类可重试数据库错误自动重试事务；如果数据库暂时不可写，Redis Stream 消息不会被 ACK，会留在 pending 列表中，空闲 5 分钟后由 worker 重新认领。这个时间要明显长于正常图片处理耗时，避免一张正在处理的图片被其他 worker 过早重复认领。
+多个 worker 高并发写入 MySQL 时，`image_tags` 删除、插入和 `images` 状态更新可能遇到 MySQL 死锁 `Error 1213 (40001)` 或锁等待超时。worker 会对这类可重试数据库错误自动重试事务；如果数据库暂时不可写，RabbitMQ 消息不会被 ack，而是进入 retry queue 延迟重试。worker 进程异常退出时，未 ack 的消息会自动回到队列，避免任务静默丢失。
 
 ## 环境要求
 
@@ -319,6 +321,8 @@ edge-node:              http://127.0.0.1:8081
 mqtt broker:            tcp://127.0.0.1:1884
 mysql:                  127.0.0.1:3307
 redis:                  127.0.0.1:6379
+rabbitmq:               amqp://127.0.0.1:5672
+rabbitmq management:    http://127.0.0.1:15672
 ```
 
 Docker 模式下 `cloud-api` 不再默认暴露宿主机 `8080`，只在 Compose 内部网络中监听 `8080`，由 frontend 容器内的 nginx 统一代理 `/api/*` 和 `/files/*`。
@@ -391,10 +395,10 @@ DEFAULT_ADMIN_USERNAME=admin
 DEFAULT_ADMIN_PASSWORD=admin123456
 ```
 
-## 3. 启动 Redis
+## 3. 启动 Redis 和 RabbitMQ
 
 ```powershell
-docker compose up -d redis
+docker compose up -d redis rabbitmq
 ```
 
 如果出现下面的错误：
@@ -405,11 +409,11 @@ proxyconnect tcp: dial tcp 127.0.0.1:7892: connect: connection refused
 
 说明 Docker Desktop 配置了代理 `127.0.0.1:7892`，但该代理端口没有启动。可任选一种方式处理：
 
-1. 打开你的代理软件，确认 HTTP 代理端口是 `7892`，然后重新执行 `docker compose up -d redis`。
+1. 打开你的代理软件，确认 HTTP 代理端口是 `7892`，然后重新执行 `docker compose up -d redis rabbitmq`。
 2. 在 Docker Desktop 中进入 `Settings -> Resources -> Proxies`，关闭代理或改成当前真实代理端口，点击 `Apply & restart` 后重试。
 3. 不使用代理时，在 Docker Desktop 关闭代理配置；如果仍失败，重启 Docker Desktop。
 
-Redis 启动成功后可检查：
+Redis 和 RabbitMQ 启动成功后可检查：
 
 ```powershell
 docker ps
@@ -429,11 +433,12 @@ Client.Timeout exceeded while awaiting headers
 
 ```powershell
 docker pull redis:7-alpine
+docker pull rabbitmq:3-management
 ```
 
-3. 如果 Docker Hub 一直不可用，可以改用本机 Redis。只要有 Redis 服务监听 `127.0.0.1:6379`，项目无需修改 `.env`。
+3. 如果 Docker Hub 一直不可用，可以改用本机 Redis 和 RabbitMQ。只要 Redis 监听 `127.0.0.1:6379`、RabbitMQ 监听 `127.0.0.1:5672`，项目无需修改 `.env`。
 
-当前实现还带有课程演示兜底：如果云端 API 或 Worker 连接 Redis 超时，系统会自动降级为 MySQL 轮询 `queued` 图片任务，保证端到端演示可继续跑通。Redis 可用时仍优先走 Redis Stream。
+当前实现还带有课程演示兜底：如果 cloud-api 或 worker 启动时连接 RabbitMQ 超时，系统会自动降级为 MySQL 轮询 `queued` 图片任务，保证端到端演示可继续跑通。RabbitMQ 可用时优先走 `image.process` 队列；Redis 只用于查询缓存。
 
 ## 4. 启动 Go 服务
 
@@ -820,16 +825,16 @@ original_storage_error
 | 网络层 | HTTP multipart 上传、设备 token 校验 |
 | 应用层 | Vue 图库、设备、任务和统计页面 |
 | 云边端协同 | 端侧采集、边缘去重缓存、云端存储分析 |
-| 流处理 | Redis Stream `image_uploaded_stream` |
+| 流处理 | RabbitMQ `image.process` 队列 |
 | 一般处理 | 图片查询、统计、缩略图生成 |
-| 分布式计算 | Worker 使用 consumer group，可启动多个并行消费 |
+| 分布式计算 | Worker 使用 RabbitMQ manual ack + prefetch，可启动多个并行消费 |
 | 智能分析 | 基于主色、尺寸、文件名的轻量 AI 标签 |
 | 网络安全 | token 校验、文件类型限制、文件大小限制 |
 
 ## 演示流程
 
 1. MySQL 执行 `deploy/mysql/init.sql`。
-2. `docker compose up -d redis`。
+2. `docker compose up -d redis rabbitmq`。
 3. 启动 `cloud-api`、`worker`、`edge-node`。
 4. 启动 3 个 `device-simulator`。
 5. 打开 Vue 前端，观察图库新增图片、任务状态从 `queued` 变为 `completed`，设备列表更新。
@@ -839,5 +844,5 @@ original_storage_error
 - `mysql` 命令不可用：使用 MySQL Workbench 等工具执行 SQL，或把 MySQL bin 目录加入 PATH。
 - `redis-server` 不可用：本项目默认用 Docker 启动 Redis。
 - `npm.ps1 cannot be loaded`：使用 `npm.cmd install` 和 `npm.cmd run dev`。
-- 上传后一直 `queued`：确认 Worker 正在运行，Redis 地址和 `.env` 一致。
+- 上传后一直 `queued`：确认 Worker 正在运行，RabbitMQ 地址和 `.env` 一致。
 - 图片上传失败：确认 `X-Device-Token` 与 `.env` 中的 `DEVICE_TOKEN` 一致。

@@ -13,22 +13,21 @@ import (
 
 	"iot-vision-platform/internal/platform"
 
-	"github.com/go-redis/redis/v8"
 	mysqlDriver "github.com/go-sql-driver/mysql"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
 	dbRetryAttempts = 8
 	dbRetryDelay    = 150 * time.Millisecond
-	pendingMinIdle  = 5 * time.Minute
 )
 
-var errRetryMessageLater = errors.New("retry stream message later")
+var errRetryMessageLater = errors.New("retry queue message later")
 
 type worker struct {
 	db       *gorm.DB
-	redis    *redis.Client
 	cfg      platform.Config
 	storage  platform.Storage
 	name     string
@@ -44,20 +43,14 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	rdb := platform.OpenRedis(cfg)
 	storage, err := platform.NewStorageFromConfig(cfg)
 	if err != nil {
 		panic(err)
 	}
 	log.Printf("storage provider %s bucket=%s", storage.Provider(), storage.Bucket())
 	ctx := context.Background()
-	useRedis := true
-	if err := platform.PingRedis(ctx, rdb); err != nil {
-		log.Printf("redis unavailable, worker will poll MySQL queued tasks: %v", err)
-		useRedis = false
-	}
 
-	w := &worker{db: db, redis: rdb, cfg: cfg, storage: storage, name: "worker-" + platform.NewID("node")}
+	w := &worker{db: db, cfg: cfg, storage: storage, name: "worker-" + platform.NewID("node")}
 	if cfg.DetectionRPCEnabled {
 		detector, err := platform.NewGRPCVisionAnalyzer(cfg.DetectionRPCAddr)
 		if err != nil {
@@ -68,129 +61,110 @@ func main() {
 			log.Printf("detection rpc enabled: %s", cfg.DetectionRPCAddr)
 		}
 	}
-	if useRedis {
-		if err := rdb.XGroupCreateMkStream(ctx, "image_uploaded_stream", "image_workers", "0").Err(); err != nil {
-			if !isBusyGroup(err) {
-				panic(err)
-			}
-		}
-	}
 	log.Printf("worker started: %s", w.name)
 	for {
-		var err error
-		if useRedis {
-			err = w.consume(ctx)
-		} else {
-			err = w.pollDatabase()
+		if err := w.drainQueuedBacklog(ctx, 20); err != nil {
+			log.Printf("database queued backlog drain failed: %v", err)
 		}
-		if err != nil {
-			log.Printf("consume error: %v", err)
+		if err := w.consumeRabbitMQ(ctx); err != nil {
+			log.Printf("rabbitmq consume unavailable, polling MySQL queued tasks temporarily: %v", err)
+			if _, pollErr := w.pollDatabaseOnce(ctx); pollErr != nil {
+				log.Printf("database polling fallback failed: %v", pollErr)
+			}
 			time.Sleep(2 * time.Second)
 		}
 	}
 }
 
-func (w *worker) consume(ctx context.Context) error {
-	if handled, err := w.consumePending(ctx); err != nil || handled {
-		return err
-	}
-	streams, err := w.readGroup(ctx, ">")
-	if errors.Is(err, redis.Nil) {
-		return nil
-	}
+func (w *worker) consumeRabbitMQ(ctx context.Context) error {
+	queue, err := platform.NewRabbitMQTaskQueue(w.cfg)
 	if err != nil {
 		return err
 	}
-	w.handleStreams(ctx, streams)
-	return nil
-}
-
-func (w *worker) consumePending(ctx context.Context) (bool, error) {
-	pending, err := w.redis.XPendingExt(ctx, &redis.XPendingExtArgs{
-		Stream: "image_uploaded_stream",
-		Group:  "image_workers",
-		Start:  "-",
-		End:    "+",
-		Count:  1,
-	}).Result()
-	if errors.Is(err, redis.Nil) || len(pending) == 0 {
-		return false, nil
-	}
+	defer queue.Close()
+	deliveries, err := queue.ConsumeImageTasks(w.name, w.cfg.RabbitMQPrefetch)
 	if err != nil {
-		return false, err
+		return err
 	}
-	for _, item := range pending {
-		if item.Idle < pendingMinIdle {
-			continue
-		}
-		messages, err := w.redis.XClaim(ctx, &redis.XClaimArgs{
-			Stream:   "image_uploaded_stream",
-			Group:    "image_workers",
-			Consumer: w.name,
-			MinIdle:  pendingMinIdle,
-			Messages: []string{item.ID},
-		}).Result()
-		if err != nil {
-			return false, err
-		}
-		w.handleMessages(ctx, messages)
-		return true, nil
-	}
-	return false, nil
-}
-
-func (w *worker) readGroup(ctx context.Context, start string) ([]redis.XStream, error) {
-	return w.redis.XReadGroup(ctx, &redis.XReadGroupArgs{
-		Group:    "image_workers",
-		Consumer: w.name,
-		Streams:  []string{"image_uploaded_stream", start},
-		Count:    1,
-		Block:    5 * time.Second,
-	}).Result()
-}
-
-func (w *worker) handleStreams(ctx context.Context, streams []redis.XStream) {
-	for _, stream := range streams {
-		w.handleMessages(ctx, stream.Messages)
-	}
-}
-
-func (w *worker) handleMessages(ctx context.Context, messages []redis.XMessage) {
-	for _, msg := range messages {
-		if err := w.process(ctx, msg); err != nil {
-			log.Printf("process failed message=%s err=%v", msg.ID, err)
-			if errors.Is(err, errRetryMessageLater) {
-				continue
+	closed := queue.NotifyClose(make(chan *amqp.Error, 1))
+	log.Printf("rabbitmq consumer started queue=%s prefetch=%d", w.cfg.RabbitMQQueue, max(1, w.cfg.RabbitMQPrefetch))
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case closeErr := <-closed:
+			if closeErr == nil {
+				return errors.New("rabbitmq connection closed")
 			}
+			return closeErr
+		case delivery, ok := <-deliveries:
+			if !ok {
+				return errors.New("rabbitmq delivery channel closed")
+			}
+			w.handleDelivery(ctx, delivery)
 		}
-		_ = w.redis.XAck(ctx, "image_uploaded_stream", "image_workers", msg.ID).Err()
 	}
 }
 
-func (w *worker) process(ctx context.Context, msg redis.XMessage) error {
-	imageID := value(msg, "image_id")
-	originalPath := value(msg, "original_path")
-	originalName := value(msg, "original_name")
+func (w *worker) handleDelivery(ctx context.Context, delivery amqp.Delivery) {
+	task, err := platform.DecodeImageTask(delivery.Body)
+	if err != nil {
+		log.Printf("discard invalid rabbitmq task delivery_tag=%d err=%v", delivery.DeliveryTag, err)
+		_ = delivery.Ack(false)
+		return
+	}
+	if err := w.process(ctx, task); err != nil {
+		log.Printf("process failed image=%s delivery_tag=%d err=%v", task.ImageID, delivery.DeliveryTag, err)
+		if errors.Is(err, errRetryMessageLater) {
+			retries := platform.RabbitMQRetryCount(delivery.Headers, w.cfg.RabbitMQQueue)
+			if retries >= int64(w.cfg.RabbitMQMaxRetries) {
+				_ = w.markFailed(task.ImageID, fmt.Errorf("retry limit exceeded after %d attempts: %v", retries, err))
+				_ = delivery.Ack(false)
+				return
+			}
+			_ = delivery.Nack(false, false)
+			return
+		}
+	}
+	_ = delivery.Ack(false)
+}
+
+func (w *worker) process(ctx context.Context, task platform.ImageTask) error {
+	imageID := strings.TrimSpace(task.ImageID)
+	originalPath := strings.TrimSpace(task.OriginalPath)
+	originalName := strings.TrimSpace(task.OriginalName)
 	if originalName == "" {
 		originalName = filepath.Base(originalPath)
 	}
 	if imageID == "" || originalPath == "" {
 		return nil
 	}
-	if err := retryDB(func() error {
-		return w.db.Model(&platform.ImageRecord{}).Where("image_id = ?", imageID).Updates(map[string]interface{}{
-			"status":        platform.StatusProcessing,
-			"error_message": "",
-		}).Error
-	}); err != nil {
-		return retryMessageLater(err)
-	}
 
 	var record platform.ImageRecord
 	if err := retryDB(func() error {
 		return w.db.Where("image_id = ?", imageID).First(&record).Error
 	}); err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if isRetryableDBError(err) {
+			return retryMessageLater(err)
+		}
 		return w.failImage(imageID, err)
+	}
+	if record.Status == platform.StatusCompleted {
+		log.Printf("skip completed image=%s", imageID)
+		return nil
+	}
+	if err := retryDB(func() error {
+		return w.db.Model(&platform.ImageRecord{}).
+			Where("image_id = ? AND status <> ?", imageID, platform.StatusCompleted).
+			Updates(map[string]interface{}{
+				"status":        platform.StatusProcessing,
+				"error_message": "",
+			}).Error
+	}); err != nil {
+		return retryMessageLater(err)
 	}
 	originalKey := w.storageKey(record.OriginalPath, record.OriginalObjectKey)
 	reader, _, err := w.storage.Get(ctx, originalKey)
@@ -295,25 +269,54 @@ func (w *worker) completeImage(imageID string, thumbKey string, hash string, wid
 	})
 }
 
-func (w *worker) pollDatabase() error {
-	var image platform.ImageRecord
-	err := w.db.Where("status = ?", platform.StatusQueued).Order("created_at asc").First(&image).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		time.Sleep(2 * time.Second)
-		return nil
+func (w *worker) drainQueuedBacklog(ctx context.Context, limit int) error {
+	if limit < 1 {
+		limit = 1
 	}
+	for i := 0; i < limit; i++ {
+		handled, err := w.pollDatabaseOnce(ctx)
+		if err != nil || !handled {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *worker) pollDatabaseOnce(ctx context.Context) (bool, error) {
+	var images []platform.ImageRecord
+	err := w.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
+			Where("status = ?", platform.StatusQueued).
+			Order("created_at asc").
+			Limit(1).
+			Find(&images).Error; err != nil {
+			return err
+		}
+		if len(images) == 0 {
+			return nil
+		}
+		return tx.Model(&platform.ImageRecord{}).
+			Where("image_id = ? AND status = ?", images[0].ImageID, platform.StatusQueued).
+			Updates(map[string]interface{}{
+				"status":        platform.StatusProcessing,
+				"error_message": "",
+			}).Error
+	})
 	if err != nil {
-		return err
+		return false, err
 	}
-	msg := redis.XMessage{Values: map[string]interface{}{
-		"image_id":      image.ImageID,
-		"original_path": image.OriginalPath,
-		"device_id":     image.DeviceID,
-		"edge_node_id":  image.EdgeNodeID,
-		"original_name": filepath.Base(image.OriginalPath),
-		"thumbnail_dir": filepath.ToSlash(filepath.Join(w.cfg.StorageRoot, "thumbnail")),
-	}}
-	return w.process(context.Background(), msg)
+	if len(images) == 0 {
+		return false, nil
+	}
+	image := images[0]
+	return true, w.process(ctx, platform.ImageTask{
+		ImageID:      image.ImageID,
+		OriginalPath: image.OriginalPath,
+		DeviceID:     image.DeviceID,
+		EdgeNodeID:   image.EdgeNodeID,
+		OriginalName: filepath.Base(image.OriginalPath),
+		ThumbnailDir: filepath.ToSlash(filepath.Join(w.cfg.StorageRoot, "thumbnail")),
+	})
 }
 
 func (w *worker) failImage(imageID string, cause error) error {
@@ -369,17 +372,6 @@ func (w *worker) detectionImageURI(ctx context.Context, originalKey string) stri
 		return strings.TrimRight(w.cfg.PublicGatewayURL, "/") + platform.PublicFileURL("original", originalKey)
 	}
 	return w.aiImageURI(ctx, originalKey)
-}
-
-func value(msg redis.XMessage, key string) string {
-	if raw, ok := msg.Values[key]; ok && raw != nil {
-		return raw.(string)
-	}
-	return ""
-}
-
-func isBusyGroup(err error) bool {
-	return err != nil && (err.Error() == "BUSYGROUP Consumer Group name already exists" || len(err.Error()) >= 9 && err.Error()[:9] == "BUSYGROUP")
 }
 
 func retryMessageLater(err error) error {

@@ -21,3 +21,4 @@ pressure-test/generated-test-images
 .env
 
 *.pdf
+doc/*
